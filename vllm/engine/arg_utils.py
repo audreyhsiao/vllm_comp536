@@ -226,6 +226,13 @@ class EngineArgs:
     @staticmethod
     def add_cli_args(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
         """Shared CLI arguments for vLLM engine."""
+        
+        parser.add_argument("--simulator", action="store_true",
+            help="Run CPU prefix-sharing simulator instead of real model.")
+        parser.add_argument("--sim-prefill-ms-per-tok", type=float, default=0.7)
+        parser.add_argument("--sim-decode-ms-base", type=float, default=1.0)
+        parser.add_argument("--sim-decode-ms-per-seq", type=float, default=0.5)
+
 
         # Model arguments
         parser.add_argument(
