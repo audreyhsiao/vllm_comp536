@@ -85,6 +85,10 @@ def nullable_kvs(val: str) -> Optional[Mapping[str, int]]:
 
 @dataclass
 class EngineArgs:
+    """ Add arguments for our simulator"""
+    sim_prefill_ms_per_tok: float = 0.7
+    sim_decode_ms_base: float     = 1.0
+    sim_decode_ms_per_seq: float  = 0.5
     """Arguments for vLLM engine."""
     model: str = 'facebook/opt-125m'
     served_model_name: Optional[Union[str, List[str]]] = None
@@ -1260,6 +1264,11 @@ class EngineArgs:
 
         if envs.VLLM_USE_V1:
             self._override_v1_engine_config(config)
+            
+        vllm_config.sim_prefill_ms_per_tok = self.sim_prefill_ms_per_tok
+        vllm_config.sim_decode_ms_base     = self.sim_decode_ms_base
+        vllm_config.sim_decode_ms_per_seq  = self.sim_decode_ms_per_seq
+        
         return config
 
     def _override_v1_engine_args(self, usage_context: UsageContext) -> None:
