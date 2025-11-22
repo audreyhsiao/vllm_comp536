@@ -89,6 +89,7 @@ class EngineArgs:
     sim_prefill_ms_per_tok: float = 0.7
     sim_decode_ms_base: float     = 1.0
     sim_decode_ms_per_seq: float  = 0.5
+    sim_trace_path: Optional[str] = None
     """Arguments for vLLM engine."""
     model: str = 'facebook/opt-125m'
     served_model_name: Optional[Union[str, List[str]]] = None
@@ -236,7 +237,8 @@ class EngineArgs:
         parser.add_argument("--sim-prefill-ms-per-tok", type=float, default=0.7)
         parser.add_argument("--sim-decode-ms-base", type=float, default=1.0)
         parser.add_argument("--sim-decode-ms-per-seq", type=float, default=0.5)
-
+        parser.add_argument("--sim-trace-path", type=str, default=None,
+    help="Path to JSONL traces with prompt_token_ids & response_token_ids.")
 
         # Model arguments
         parser.add_argument(
@@ -1268,6 +1270,7 @@ class EngineArgs:
         vllm_config.sim_prefill_ms_per_tok = self.sim_prefill_ms_per_tok
         vllm_config.sim_decode_ms_base     = self.sim_decode_ms_base
         vllm_config.sim_decode_ms_per_seq  = self.sim_decode_ms_per_seq
+        vllm_config.sim_trace_path = self.sim_trace_path
         
         return config
 
