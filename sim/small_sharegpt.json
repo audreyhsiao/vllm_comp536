@@ -1,0 +1,36 @@
+[
+  {
+    "id": "conv_1",
+    "conversations": [
+      { "from": "human", "value": "Hello! Can you help me plan a trip to Japan?" },
+      { "from": "gpt",   "value": "Sure! When are you planning to go?" },
+      { "from": "human", "value": "Next month. I will stay for 5 days." },
+      { "from": "gpt",   "value": "Great! Do you prefer cities or nature?" }
+    ],
+    "t": 1700000000
+  },
+  {
+    "id": "conv_2",
+    "conversations": [
+      { "from": "human", "value": "Explain recursion to me." },
+      { "from": "gpt",   "value": "Recursion is a function calling itself." }
+    ],
+    "timestamp": 1700000050
+  },
+  {
+    "id": "conv_3",
+    "conversations": [
+      { "from": "human", "value": "What is 2 + 2?" }
+    ],
+    "t": 1700000100
+  },
+  {
+    "id": "conv_4",
+    "conversations": [
+      { "from": "human", "value": "Write a haiku about sunsets." },
+      { "from": "gpt",   "value": "Golden sky fades slow\nwhispers curl on gentle breeze\nnight dances in light" },
+      { "from": "human", "value": "Write another one about winter." }
+    ],
+    "timestamp": 1700000200
+  }
+]

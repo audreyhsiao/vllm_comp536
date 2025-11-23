@@ -2,11 +2,11 @@
 Client Simulator for ShareGPT Dataset Replay
 
 This module implements a client simulator that replays collected prompts from
-ShareGPT dataset as input for the vLLM simulator. It handles:
+ShareGPT dataset as input for a vLLM OpenAI-compatible server. It handles:
 - Loading ShareGPT dataset
 - Timing simulation (using timestamps or Poisson distribution)
 - Chat template formatting for different models
-- Request submission to the simulator backend
+- Request submission to the vLLM backend via HTTP
 """
 from __future__ import annotations
 import argparse
@@ -16,22 +16,12 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 import sys
+
 import numpy as np
 from transformers import AutoTokenizer
-
-# Import the simulator backend
-# Handle different import paths
-sim_path = Path(__file__).parent
-if str(sim_path) not in sys.path:
-    sys.path.insert(0, str(sim_path))
-
-try:
-    from simulator_backend import SimulatorBackend
-except ImportError:
-    # Try alternative import path
-    from sim.simulator_backend import SimulatorBackend
+import aiohttp
 
 
 @dataclass
@@ -203,6 +193,12 @@ class ChatTemplateFormatter:
         self.tokenizer_path = tokenizer_path or model_name
         self.chat_template = chat_template
         
+        # If chat_template is a file path, load its content
+        if self.chat_template and isinstance(self.chat_template, str):
+            p = Path(self.chat_template)
+            if p.exists():
+                self.chat_template = p.read_text(encoding="utf-8")
+        
         # Load tokenizer if model_name is provided
         self.tokenizer = None
         if self.tokenizer_path:
@@ -241,8 +237,6 @@ class ChatTemplateFormatter:
             return formatted
         
         # Convert messages to format expected by tokenizer
-        # tokenizer.apply_chat_template expects messages in format:
-        # [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
         try:
             formatted = self.tokenizer.apply_chat_template(
                 messages,
@@ -299,11 +293,93 @@ class ChatTemplateFormatter:
         return hashlib.sha1(prefix_text.encode()).hexdigest()[:16]
 
 
+class VLLMHttpBackend:
+    """HTTP backend that talks to a running vLLM OpenAI-compatible server."""
+
+    def __init__(self, server_url: str, model: str, timeout: float = 60.0):
+        """
+        Args:
+            server_url: Base URL of vLLM server, e.g. http://127.0.0.1:8000
+            model: Model name as seen by vLLM server
+            timeout: Request timeout in seconds
+        """
+        self.server_url = server_url.rstrip("/")
+        self.model = model
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.session: Optional[aiohttp.ClientSession] = None
+
+        # Simple stats; real prefix-sharing metrics should be collected server-side
+        self.finished_requests = 0
+
+    async def _ensure_session(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(timeout=self.timeout)
+
+    async def add_request(
+        self,
+        prompt: str,
+        max_tokens: int,
+        prefix_key: Optional[str],
+        stream: bool,
+        request_id: str,
+    ):
+        """Send one request to vLLM via /v1/completions.
+
+        We use the completions API because the client already applied the chat template
+        and produced a plain text prompt.
+        """
+        await self._ensure_session()
+        url = f"{self.server_url}/v1/completions"
+
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": False,  # easier to debug; you can switch to True later if needed
+        }
+
+        # If your vLLM simulator supports extra fields in the request body, you can pass
+        # prefix-related info here. How it's used depends on your server-side changes.
+        extra_body: Dict[str, Any] = {"request_id": request_id}
+        if prefix_key is not None:
+            extra_body["prefix_key"] = prefix_key
+        if extra_body:
+            payload["extra_body"] = extra_body
+
+        async with self.session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"vLLM request failed: status={resp.status}, body={text}"
+                )
+            data = await resp.json()
+            self.finished_requests += 1
+            # Task2 之後如果要從回應裡帶 metrics，可以在這裡處理
+            return data
+
+    async def finalize(self):
+        """Cleanup resources."""
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
+
+    def report(self) -> Dict[str, Any]:
+        """Return simple backend stats.
+
+        真正的 prefix sharing / cache metrics 之後可以擴充成從 vLLM server 拉取。
+        """
+        return {
+            "finished": self.finished_requests,
+            "kv_evictions": 0,
+            "kv_templates": {},
+        }
+
+
 class ClientSimulator:
     """Main client simulator that replays ShareGPT conversations."""
     
     def __init__(self,
-                 simulator_backend: SimulatorBackend,
+                 simulator_backend: VLLMHttpBackend,
                  chat_formatter: ChatTemplateFormatter,
                  timing_simulator: TimingSimulator,
                  max_tokens_per_request: int = 512):
@@ -353,7 +429,7 @@ class ClientSimulator:
         
         # Process each conversation
         tasks = []
-        for i, conv in enumerate(conversations):
+        for conv in conversations:
             # Calculate arrival time offset (relative to first request)
             arrival_offset = self.timing.get_next_arrival_time(conv)
             
@@ -388,14 +464,12 @@ class ClientSimulator:
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
             
-            # Format the conversation using chat template
             # For multi-turn conversations, we'll submit each user message separately
-            # and track the conversation state
             messages = conversation.messages
             if not messages:
                 return
             
-            # Find all user messages and their corresponding assistant responses
+            # Find all user messages
             all_user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
             if not all_user_indices:
                 return
@@ -437,10 +511,7 @@ class ClientSimulator:
                         request_id=request_id
                     )
                     
-                    # Wait for completion (simplified: just wait a bit)
-                    # In a real implementation, you'd track request completion
-                    await asyncio.sleep(0.1)
-                    
+                    # Wait for completion (目前用非 stream，同步回傳就算完成)
                     self.stats["total_requests"] += 1
                     self.stats["completed_requests"] += 1
                     latency_ms = (time.time() - start_time) * 1000
@@ -485,7 +556,7 @@ async def main():
     
     # Model and template options
     parser.add_argument("--model-name", type=str, default=None,
-                       help="HuggingFace model name for chat template")
+                       help="HuggingFace model name for chat template and vLLM backend")
     parser.add_argument("--tokenizer-path", type=str, default=None,
                        help="Path to tokenizer (if different from model-name)")
     parser.add_argument("--chat-template", type=str, default=None,
@@ -502,24 +573,20 @@ async def main():
     
     # Replay mode
     parser.add_argument("--mode", type=str, choices=["single", "multi"],
-                       default="multi",
-                       help="Conversation replay mode: 'single' = first user turn only, 'multi' = all user turns")
+                        default="multi",
+                        help="Conversation replay mode: 'single' = first user turn only, 'multi' = all user turns")
     
-    # Simulator backend options
-    parser.add_argument("--block-size", type=int, default=16,
-                       help="KV cache block size")
-    parser.add_argument("--num-blocks", type=int, default=200000,
-                       help="Number of KV cache blocks")
-    parser.add_argument("--max-prefill-tokens", type=int, default=8192,
-                       help="Maximum prefill tokens per batch")
-    parser.add_argument("--max-decode-batch", type=int, default=32,
-                       help="Maximum decode batch size")
+    # vLLM server options
+    parser.add_argument("--server-url", type=str, default="http://127.0.0.1:8000",
+                        help="Base URL of the running vLLM OpenAI-compatible server")
+    parser.add_argument("--backend-model-name", type=str, default=None,
+                        help="Model name as seen by vLLM backend (default: --model-name)")
     
     # Request options
     parser.add_argument("--max-tokens", type=int, default=512,
                        help="Maximum tokens to generate per request")
     parser.add_argument("--prefix-sharing", action="store_true", default=True,
-                       help="Enable prefix sharing")
+                       help="Enable prefix sharing (client side key generation)")
     parser.add_argument("--no-prefix-sharing", dest="prefix_sharing",
                        action="store_false",
                        help="Disable prefix sharing")
@@ -527,6 +594,11 @@ async def main():
                        help="Use full conversation as prefix key (not just first message)")
     
     args = parser.parse_args()
+
+    if args.model_name is None:
+        raise ValueError("--model-name is required (for tokenizer and backend model)")
+    
+    backend_model_name = args.backend_model_name or args.model_name
     
     # Load dataset
     print("Loading ShareGPT dataset...")
@@ -551,15 +623,13 @@ async def main():
         poisson_lambda=args.poisson_lambda
     )
     
-    simulator_backend = SimulatorBackend(
-        block_size=args.block_size,
-        num_blocks=args.num_blocks,
-        max_prefill_tokens=args.max_prefill_tokens,
-        max_decode_batch=args.max_decode_batch
+    backend = VLLMHttpBackend(
+        server_url=args.server_url,
+        model=backend_model_name,
     )
     
     client_simulator = ClientSimulator(
-        simulator_backend=simulator_backend,
+        simulator_backend=backend,
         chat_formatter=chat_formatter,
         timing_simulator=timing_simulator,
         max_tokens_per_request=args.max_tokens
@@ -577,12 +647,12 @@ async def main():
     )
     
     # Finalize backend
-    await simulator_backend.finalize()
+    await backend.finalize()
     
     # Print statistics
     elapsed_time = time.time() - start_time
     stats = client_simulator.get_stats()
-    backend_report = simulator_backend.report()
+    backend_report = backend.report()
     
     print("\n" + "="*60)
     print("Simulation Statistics")
