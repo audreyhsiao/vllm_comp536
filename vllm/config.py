@@ -8,6 +8,8 @@ import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Counter, Dict,
                     Final, List, Literal, Mapping, Optional, Set, Tuple, Type,
                     Union)
@@ -628,6 +630,20 @@ class ModelConfig:
 
     def verify_async_output_proc(self, parallel_config, speculative_config,
                                  device_config) -> None:
+        if not getattr(self, "use_async_output_proc", False):
+            return
+        
+        from vllm.platforms import current_platform
+        try:
+            supported = current_platform.is_async_output_supported(self.enforce_eager)
+        except NotImplementedError:
+            # fix for simulator testing
+            self.use_async_output_proc = False
+            return
+
+        if not supported:
+            self.use_async_output_proc = False
+
         if not self.use_async_output_proc:
             # Nothing to check
             return
@@ -1324,7 +1340,7 @@ class ParallelConfig:
         from vllm.executor.executor_base import ExecutorBase
 
         if self.distributed_executor_backend not in (
-                "ray", "mp", None) and not (isinstance(
+                "ray", "mp", "sim", None) and not (isinstance(
                     self.distributed_executor_backend, type) and issubclass(
                         self.distributed_executor_backend, ExecutorBase)):
             raise ValueError(
@@ -2958,7 +2974,13 @@ class VllmConfig:
     """Dataclass which contains all vllm-related configuration. This
     simplifies passing around the distinct configurations in the codebase.
     """
-
+    
+    """Audrey: variables for simulator"""
+    sim_trace_path: Optional[str] = None
+    sim_prefill_ms_per_tok: float = 0.0
+    sim_decode_ms_base: float = 0.0
+    sim_decode_ms_per_seq: float = 0.0
+    
     model_config: ModelConfig = field(default=None, init=True)  # type: ignore
     cache_config: CacheConfig = field(default=None, init=True)  # type: ignore
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig,

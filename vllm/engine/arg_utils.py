@@ -1267,11 +1267,11 @@ class EngineArgs:
         if envs.VLLM_USE_V1:
             self._override_v1_engine_config(config)
             
-        vllm_config.sim_prefill_ms_per_tok = self.sim_prefill_ms_per_tok
-        vllm_config.sim_decode_ms_base     = self.sim_decode_ms_base
-        vllm_config.sim_decode_ms_per_seq  = self.sim_decode_ms_per_seq
-        vllm_config.sim_trace_path = self.sim_trace_path
-        
+        config.sim_trace_path = self.sim_trace_path
+        config.sim_prefill_ms_per_tok = self.sim_prefill_ms_per_tok
+        config.sim_decode_ms_base = self.sim_decode_ms_base
+        config.sim_decode_ms_per_seq = self.sim_decode_ms_per_seq
+
         return config
 
     def _override_v1_engine_args(self, usage_context: UsageContext) -> None:
