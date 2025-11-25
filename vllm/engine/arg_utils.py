@@ -16,6 +16,7 @@ from vllm.config import (CacheConfig, CompilationConfig, ConfigFormat,
                          SpeculativeConfig, TaskOption, TokenizerPoolConfig,
                          VllmConfig)
 from vllm.executor.executor_base import ExecutorBase
+from vllm.executor.simulator_executor import SimulatorExecutor
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.platforms import current_platform
@@ -402,7 +403,7 @@ class EngineArgs:
         # Parallel arguments
         parser.add_argument(
             '--distributed-executor-backend',
-            choices=['ray', 'mp'],
+            choices=['ray', 'mp', 'sim'],
             default=EngineArgs.distributed_executor_backend,
             help='Backend to use for distributed model '
             'workers, either "ray" or "mp" (multiprocessing). If the product '
@@ -977,6 +978,12 @@ class EngineArgs:
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         # Set the attributes from the parsed arguments.
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
+
+        # 如果有開 --simulator，就改用 SimulatorExecutor 當 backend
+        if getattr(args, "simulator", False):
+            engine_args.distributed_executor_backend = SimulatorExecutor
+            engine_args.worker_use_ray = False  # 保證不要不小心走 ray
+
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
