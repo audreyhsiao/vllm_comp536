@@ -30,12 +30,14 @@ exec "$PY" -m vllm.entrypoints.openai.api_server \
   --model facebook/opt-125m \
   --served-model-name trace-sim \
   --device cpu \
-  --dtype float16 \
+  --dtype float32 \
   --distributed-executor-backend sim \
   --sim-trace-path "$TRACE" \
   --sim-prefill-ms-per-tok "$SIM_PREFILL_MS_PER_TOK" \
   --sim-decode-ms-base "$SIM_DECODE_MS_BASE" \
   --sim-decode-ms-per-seq "$SIM_DECODE_MS_PER_SEQ" \
-  --skip-tokenizer-init \
   --max-seq-len 128 \
-  --disable-log-requests
+  --enable-prefix-caching \
+  --enforce-eager \
+  --disable-log-requests \
+  --disable-frontend-multiprocessing
