@@ -66,6 +66,8 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
                         is_valid_ipv6_address)
 from vllm.version import __version__ as VLLM_VERSION
+from vllm.prefix_stats_collector import global_prefix_collector
+
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
@@ -498,6 +500,7 @@ def build_app(args: Namespace) -> FastAPI:
         app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     app.root_path = args.root_path
+    print("LOADED VLLM FROM:", __file__)
 
     mount_metrics(app)
 
@@ -550,6 +553,21 @@ def build_app(args: Namespace) -> FastAPI:
         else:
             raise ValueError(f"Invalid middleware {middleware}. "
                              f"Must be a function or a class.")
+
+    # ---------------------------------------------------------------------
+    # ⭐ NEW: prefix stats collector endpoint
+    # ---------------------------------------------------------------------
+
+    @app.get("/dump_prefix_stats")
+    def dump_prefix_stats():
+        """Dump prefix-sharing statistics to a JSON file."""
+        output_path = "prefix_stats.json"
+        global_prefix_collector.dump(output_path)
+        data = global_prefix_collector.snapshot()
+        # print("[prefix-debug] snapshot: requests =", len(data["requests"]), "blocks =", len(data["blocks"]), flush=True)
+
+        return {"status": "ok", "path": output_path}
+    # ---------------------------------------------------------------------
 
     return app
 

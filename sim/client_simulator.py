@@ -53,7 +53,7 @@ class ShareGPTLoader:
             # Parse conversations
             messages = []
             for conv in item.get('conversations', []):
-                role = conv.get('from', '').lower()
+                role = conv.get('role', '').lower()
                 if role == 'human' or role == 'user':
                     role = 'user'
                 elif role == 'gpt' or role == 'assistant':
@@ -61,7 +61,7 @@ class ShareGPTLoader:
                 else:
                     continue  # Skip unknown roles
                 
-                content = conv.get('value', '')
+                content = conv.get('content', '')
                 if content:
                     messages.append({"role": role, "content": content})
             
@@ -105,7 +105,7 @@ class ShareGPTLoader:
             # Parse conversations
             messages = []
             for conv in item.get('conversations', []):
-                role = conv.get('from', '').lower()
+                role = conv.get('role', '').lower()
                 if role == 'human' or role == 'user':
                     role = 'user'
                 elif role == 'gpt' or role == 'assistant':
@@ -113,7 +113,7 @@ class ShareGPTLoader:
                 else:
                     continue
                 
-                content = conv.get('value', '')
+                content = conv.get('content', '')
                 if content:
                     messages.append({"role": role, "content": content})
             
@@ -323,10 +323,10 @@ class VLLMHttpBackend:
         stream: bool,
         request_id: str,
     ):
-        """Send one request to vLLM via /v1/completions.
+        """Send one request to vLLM via /v1/completions (OpenAI v0-style).
 
-        We use the completions API because the client already applied the chat template
-        and produced a plain text prompt.
+        We use the text completions API because the client already applied the
+        chat template and produced a plain text prompt.
         """
         await self._ensure_session()
         url = f"{self.server_url}/v1/completions"
@@ -335,11 +335,11 @@ class VLLMHttpBackend:
             "model": self.model,
             "prompt": prompt,
             "max_tokens": max_tokens,
-            "stream": False,  # easier to debug; you can switch to True later if needed
+            # 這是 OpenAI v0 的 field，vLLM 也支援
+            "stream": stream,
         }
 
-        # If your vLLM simulator supports extra fields in the request body, you can pass
-        # prefix-related info here. How it's used depends on your server-side changes.
+        # 額外 metadata，server 那邊目前會 ignore 掉，但對 project 有用
         extra_body: Dict[str, Any] = {"request_id": request_id}
         if prefix_key is not None:
             extra_body["prefix_key"] = prefix_key
@@ -354,7 +354,6 @@ class VLLMHttpBackend:
                 )
             data = await resp.json()
             self.finished_requests += 1
-            # Task2 之後如果要從回應裡帶 metrics，可以在這裡處理
             return data
 
     async def finalize(self):
@@ -382,7 +381,7 @@ class ClientSimulator:
                  simulator_backend: VLLMHttpBackend,
                  chat_formatter: ChatTemplateFormatter,
                  timing_simulator: TimingSimulator,
-                 max_tokens_per_request: int = 512):
+                 max_tokens_per_request: int = 128):
         """
         Args:
             simulator_backend: The simulator backend to send requests to
@@ -484,7 +483,7 @@ class ClientSimulator:
                 # Get conversation context up to this user message
                 context_messages = messages[:user_idx + 1]
                 
-                # Format the prompt
+                # Format the prompt (已經是 v0 的 plain text prompt)
                 prompt = self.chat_formatter.format_conversation(
                     context_messages,
                     add_generation_prompt=True
@@ -497,7 +496,51 @@ class ClientSimulator:
                         context_messages,
                         use_full_conversation=use_full_conversation_prefix
                     )
-                
+
+                # =====================
+                # 這一段是新加的：用 tokenizer 控制 context 長度
+                # =====================
+                max_context_tokens = 2048
+                # 先用 argparse 給的 max_tokens，再 clamp 一次
+                new_tokens = min(self.max_tokens, 512)
+
+                tokenizer = self.chat_formatter.tokenizer
+                if tokenizer is not None:
+                    enc = tokenizer(
+                        prompt,
+                        add_special_tokens=False,
+                        return_attention_mask=False,
+                        return_token_type_ids=False,
+                    )
+                    input_ids = enc["input_ids"]
+                    total_tokens = len(input_ids) + new_tokens
+
+                    if total_tokens > max_context_tokens:
+                        # 允許的最大 prompt token 數量
+                        allowed_input = max_context_tokens - new_tokens
+                        if allowed_input <= 0:
+                            # 最壞情況：至少保留 1 個輸入 token + 1 個輸出 token
+                            allowed_input = max_context_tokens - 1
+                            new_tokens = 1
+
+                        # 只保留最後 allowed_input 個 token，對 prefix sharing 也合理
+                        input_ids = input_ids[-allowed_input:]
+                        prompt = tokenizer.decode(
+                            input_ids,
+                            skip_special_tokens=True,
+                            clean_up_tokenization_spaces=True,
+                        )
+                else:
+                    # fallback：tokenizer 載不到時，用很保守的 word-based 近似
+                    approx_limit = 512
+                    words = prompt.split()
+                    if len(words) > approx_limit:
+                        words = words[-approx_limit:]
+                        prompt = " ".join(words)
+                        # 這種情況也把 new_tokens 壓小一點
+                        new_tokens = min(new_tokens, 128)
+                # =====================
+
                 # Submit request
                 request_id = f"{conversation.conversation_id}_turn_{user_idx}"
                 start_time = time.time()
@@ -505,13 +548,12 @@ class ClientSimulator:
                 try:
                     await self.backend.add_request(
                         prompt=prompt,
-                        max_tokens=self.max_tokens,
+                        max_tokens=new_tokens,
                         prefix_key=prefix_key,
-                        stream=True,
-                        request_id=request_id
+                        stream=False,  # v0 style，拿完整回應就好
+                        request_id=request_id,
                     )
                     
-                    # Wait for completion (目前用非 stream，同步回傳就算完成)
                     self.stats["total_requests"] += 1
                     self.stats["completed_requests"] += 1
                     latency_ms = (time.time() - start_time) * 1000
@@ -583,7 +625,7 @@ async def main():
                         help="Model name as seen by vLLM backend (default: --model-name)")
     
     # Request options
-    parser.add_argument("--max-tokens", type=int, default=512,
+    parser.add_argument("--max-tokens", type=int, default=128,
                        help="Maximum tokens to generate per request")
     parser.add_argument("--prefix-sharing", action="store_true", default=True,
                        help="Enable prefix sharing (client side key generation)")

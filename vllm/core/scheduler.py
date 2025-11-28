@@ -18,6 +18,10 @@ from vllm.sequence import (Sequence, SequenceData, SequenceGroup,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
 
+from vllm.prefix_stats_collector import global_prefix_collector
+import time
+
+
 logger = init_logger(__name__)
 
 # Test-only. If configured, decode is preempted with
@@ -1338,6 +1342,14 @@ class Scheduler:
                 common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
                         seq_group.get_seqs(status=SequenceStatus.RUNNING)))
+                if common_computed_block_nums:
+                    request_id = getattr(seq_group, "request_id", None)
+                    global_prefix_collector.record_hit(
+                        request_id=request_id,
+                        block_ids=common_computed_block_nums,
+                        timestamp=time.time(),
+                    )
+
 
             do_sample = True
             is_prompt = seq_group.is_prefill()

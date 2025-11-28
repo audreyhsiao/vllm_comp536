@@ -13,6 +13,9 @@ from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
+# 新增：prefix sharing 統計收集器
+from vllm.prefix_stats_collector import global_prefix_collector
+
 SeqId = int
 EncoderSeqId = str
 
@@ -69,6 +72,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+
+        # 告訴 prefix stats collector 目前的 block_size
+        global_prefix_collector.set_block_size(self.block_size)
 
         self.sliding_window = sliding_window
         # max_block_sliding_window is the max number of blocks that need to be

@@ -517,32 +517,16 @@ class TorchSDPABackendImpl(AttentionImpl[TorchSDPAMetadata]):
         output = torch.empty_like(query)
         if prefill_meta := attn_metadata.prefill_metadata:
             assert attn_metadata.seq_lens is not None
-            if not prefill_meta.prefill_metadata.chunked_prefill:  # type: ignore
-                self._run_sdpa_forward(output,
-                                       query,
-                                       key,
-                                       value,
-                                       prefill_meta,
-                                       attn_type=attn_type)
-            else:
-                # prefix-enabled attention
-                assert not self.need_mask
-                import intel_extension_for_pytorch.llm.modules as ipex_modules
-                output = torch.empty_like(query)
-                ipex_modules.PagedAttention.flash_attn_varlen_func(
-                    output[:prefill_meta.num_prefill_tokens, :, :],
-                    query[:prefill_meta.num_prefill_tokens, :, :],
-                    key_cache,
-                    value_cache,
-                    prefill_meta.query_start_loc,
-                    prefill_meta.kv_start_loc,
-                    prefill_meta.max_query_len,
-                    prefill_meta.max_kv_len,
-                    self.scale,
-                    True,
-                    prefill_meta.prefill_block_tables,
-                    self.alibi_slopes,
-                )
+            # 在 CPU + 作業環境裡，無論是否 chunked_prefill，一律用 SDPA，
+            # 不要走 IPEX / flash-attn 分支，避免依賴 intel_extension_for_pytorch。
+            self._run_sdpa_forward(
+                output,
+                query,
+                key,
+                value,
+                prefill_meta,
+                attn_type=attn_type,
+            )
 
         if decode_meta := attn_metadata.decode_metadata:
             assert attn_type != AttentionType.ENCODER_ONLY, (

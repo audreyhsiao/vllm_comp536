@@ -61,6 +61,8 @@ from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
 from vllm.utils import Counter, Device, deprecate_kwargs, weak_bind
 from vllm.version import __version__ as VLLM_VERSION
 
+from vllm.prefix_stats_collector import global_prefix_collector
+
 logger = init_logger(__name__)
 _LOCAL_LOGGING_INTERVAL_SEC = 5
 
@@ -622,6 +624,21 @@ class LLMEngine:
         seq = Sequence(seq_id, decoder_inputs, block_size, eos_token_id,
                        lora_request, prompt_adapter_request)
 
+        # ⭐ NEW: 用 Sequence 直接算 prompt 長度，記到 prefix stats
+        try:
+            token_ids = seq.get_token_ids()
+            if token_ids is not None:
+                prompt_len = len(token_ids)
+                if prompt_len > 0:
+                    global_prefix_collector.record_prompt_length(
+                        request_id=request_id,
+                        prompt_tokens=prompt_len,
+                    )
+        except Exception:
+            # 安全起見，不要讓錯誤影響正常推論
+            pass
+        # ⭐ NEW 結束
+
         encoder_seq = (None if encoder_inputs is None else Sequence(
             seq_id, encoder_inputs, block_size, eos_token_id, lora_request,
             prompt_adapter_request))
@@ -777,10 +794,36 @@ class LLMEngine:
         if arrival_time is None:
             arrival_time = time.time()
 
+        # ---------------- prefix stats: 記錄 prompt 長度 ----------------
+        # 不依賴 tokenizer，避免 trace-sim 情況下 self.tokenizer 為 None
+        prompt_tokens_est = 0
+        # 最常見情況：prompt 是一個 string（已經 apply_chat_template 後）
+        if isinstance(prompt, str):
+            # 用單字數當作「token 數」的近似值就好
+            prompt_tokens_est = len(prompt.split())
+        # 也可能是 chat 格式：list[{"role": ..., "content": ...}, ...]
+        elif isinstance(prompt, list):
+            texts = []
+            for msg in prompt:
+                if isinstance(msg, dict):
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        texts.append(content)
+            if texts:
+                prompt_tokens_est = len(" ".join(texts).split())
+
+        if prompt_tokens_est > 0:
+            global_prefix_collector.record_prompt_length(
+                request_id=request_id,
+                prompt_tokens=prompt_tokens_est,
+            )
+        # ---------------------------------------------------------------
+
         if self.tokenizer is not None:
             self._validate_token_prompt(
                 prompt,
                 tokenizer=self.get_tokenizer(lora_request=lora_request))
+
 
         preprocessed_inputs = self.input_preprocessor.preprocess(
             prompt,
