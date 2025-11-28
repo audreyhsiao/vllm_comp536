@@ -40,4 +40,5 @@ exec "$PY" -m vllm.entrypoints.openai.api_server \
   --enable-prefix-caching \
   --enforce-eager \
   --disable-log-requests \
+  --gpu-memory-utilization 0.3 \
   --disable-frontend-multiprocessing
