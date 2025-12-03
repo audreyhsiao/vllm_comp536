@@ -18,4 +18,4 @@ python -m vllm.entrypoints.openai.api_server \
   --disable-log-requests \
   --skip-tokenizer-init \
   --disable-frontend-multiprocessing \
-  --eviction-policy lru
+  --eviction-policy fifo

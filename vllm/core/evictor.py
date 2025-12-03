@@ -241,7 +241,7 @@ class FIFOEvictor(Evictor):
     def __init__(self):
         self.free_table: Dict[int, BlockMetaData] = {}
         # (insert_seq, block_id, content_hash)
-        self.priority_queue: List[Tuple[int, int, int]] = []
+        self.priority_queue: List[Tuple[int, int]] = []
         self._next_seq: int = 0
 
     def __contains__(self, block_id: int) -> bool:
@@ -252,25 +252,23 @@ class FIFOEvictor(Evictor):
             raise ValueError("No usable cache memory left")
 
         while self.priority_queue:
-            insert_seq, block_id, content_hash = heapq.heappop(
-                self.priority_queue
-            )
-            if block_id in self.free_table:
-                # 不做 seq 檢查，FIFO 不關心 update
-                self.free_table.pop(block_id)
-                return block_id, content_hash
+            insert_seq, block_id = heapq.heappop(self.priority_queue)
+            meta = self.free_table.get(block_id)
+            if meta is None:
+                # 過期 entry，略過
+                continue
+
+            self.free_table.pop(block_id)
+            return block_id, meta.content_hash
 
         raise ValueError("No usable cache memory left")
 
     def add(self, block_id: int, content_hash: int,
-            num_hashed_tokens: int, last_accessed: float):
+        num_hashed_tokens: int, last_accessed: float):
         meta = BlockMetaData(content_hash, num_hashed_tokens, last_accessed)
         self.free_table[block_id] = meta
         self._next_seq += 1
-        heapq.heappush(
-            self.priority_queue,
-            (self._next_seq, block_id, content_hash),
-        )
+        heapq.heappush(self.priority_queue, (self._next_seq, block_id))
 
     def update(self, block_id: int, last_accessed: float):
         # FIFO 不會因 access 改變 eviction 順序，
