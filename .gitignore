@@ -224,4 +224,5 @@ ShareGPT_V3_unfiltered_cleaned_split.json
 prefix_stats*.json
 sim/*.json
 
-figs
+figs*
+sim/dataset*
