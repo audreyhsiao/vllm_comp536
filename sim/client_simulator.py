@@ -37,52 +37,111 @@ class ShareGPTLoader:
     """Loads and parses ShareGPT dataset."""
     
     @staticmethod
+    def _parse_conversation_item(item: Dict[str, Any], 
+                                 conv_index: int) -> Optional[ShareGPTConversation]:
+        """Parse a single conversation item into ShareGPTConversation."""
+        # Parse conversations
+        messages = []
+        for conv in item.get('conversations', []):
+            role = conv.get('role', '').lower()
+            if role == 'human' or role == 'user':
+                role = 'user'
+            elif role == 'gpt' or role == 'assistant':
+                role = 'assistant'
+            else:
+                continue  # Skip unknown roles
+            
+            content = conv.get('content', '')
+            if content:
+                messages.append({"role": role, "content": content})
+        
+        if not messages:
+            return None  # Skip empty conversations
+        
+        # Extract timestamp if available
+        timestamp = item.get('t') or item.get('timestamp')
+        if timestamp:
+            try:
+                timestamp = float(timestamp)
+            except (ValueError, TypeError):
+                timestamp = None
+        
+        return ShareGPTConversation(
+            conversation_id=item.get('id', f"conv_{conv_index}"),
+            messages=messages,
+            timestamp=timestamp,
+            metadata=item
+        )
+    
+    @staticmethod
     def load_from_file(file_path: str) -> List[ShareGPTConversation]:
         """Load ShareGPT conversations from a JSON file.
+        
+        Supports both JSON array format and JSONL format (one JSON object per line).
+        Uses streaming parsing for large files to avoid OOM.
         
         Expected format: List of dicts with keys like:
         - "id": conversation ID
         - "conversations": List of {"from": "human"/"gpt", "value": "..."}
         - "t": timestamp (optional)
         """
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
         conversations = []
-        for item in data:
-            # Parse conversations
-            messages = []
-            for conv in item.get('conversations', []):
-                role = conv.get('role', '').lower()
-                if role == 'human' or role == 'user':
-                    role = 'user'
-                elif role == 'gpt' or role == 'assistant':
-                    role = 'assistant'
-                else:
-                    continue  # Skip unknown roles
-                
-                content = conv.get('content', '')
-                if content:
-                    messages.append({"role": role, "content": content})
-            
-            if not messages:
-                continue  # Skip empty conversations
-            
-            # Extract timestamp if available
-            timestamp = item.get('t') or item.get('timestamp')
-            if timestamp:
-                try:
-                    timestamp = float(timestamp)
-                except (ValueError, TypeError):
-                    timestamp = None
-            
-            conv = ShareGPTConversation(
-                conversation_id=item.get('id', f"conv_{len(conversations)}"),
-                messages=messages,
-                timestamp=timestamp,
-                metadata=item
-            )
-            conversations.append(conv)
+        
+        # Try to detect file format by reading first few bytes
+        # JSONL format: each line is a separate JSON object
+        # JSON array format: starts with '[' and contains array of objects
+        with open(file_path, 'rb') as f:
+            first_bytes = f.read(1024).strip()
+            # Check if it starts with '[' (JSON array) or '{' (JSONL/JSON object)
+            is_jsonl = not first_bytes.startswith(b'[')
+        
+        # Also check file extension as hint
+        file_ext = Path(file_path).suffix.lower()
+        if file_ext == '.jsonl':
+            is_jsonl = True
+        elif file_ext == '.json' and not is_jsonl:
+            # .json file starting with '[' is likely JSON array format
+            pass
+        
+        if is_jsonl:
+            # JSONL format: one JSON object per line
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                        conv = ShareGPTLoader._parse_conversation_item(item, len(conversations))
+                        if conv:
+                            conversations.append(conv)
+                    except json.JSONDecodeError as e:
+                        print(f"Warning: Failed to parse line {line_num + 1}: {e}", file=sys.stderr)
+                        continue
+        else:
+            # Standard JSON array format: use streaming JSON parser
+            # Use ijson if available, otherwise fall back to chunked reading
+            try:
+                import ijson
+                # Use ijson for streaming JSON array parsing
+                with open(file_path, 'rb') as f:
+                    parser = ijson.items(f, 'item')
+                    for item in parser:
+                        conv = ShareGPTLoader._parse_conversation_item(item, len(conversations))
+                        if conv:
+                            conversations.append(conv)
+            except ImportError:
+                # Fallback: read in chunks and parse incrementally
+                # This is less memory efficient but works without ijson
+                print("Warning: ijson not available. Loading entire file into memory.", 
+                      file=sys.stderr)
+                print("For large files, install ijson: pip install ijson", file=sys.stderr)
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for item in data:
+                        conv = ShareGPTLoader._parse_conversation_item(item, len(conversations))
+                        if conv:
+                            conversations.append(conv)
         
         return conversations
     
@@ -207,6 +266,25 @@ class ChatTemplateFormatter:
                     self.tokenizer_path,
                     trust_remote_code=True
                 )
+                # If tokenizer doesn't have a chat_template and no custom template provided,
+                # use a default simple template for OPT models
+                if (self.chat_template is None and 
+                    (not hasattr(self.tokenizer, 'chat_template') or 
+                     self.tokenizer.chat_template is None)):
+                    # Default simple template for models without chat_template
+                    default_template = (
+                        "{%- for message in messages %}\n"
+                        "{%- if message['role'] == 'user' %}\n"
+                        "User: {{ message['content'] }}\n"
+                        "{%- elif message['role'] == 'assistant' %}\n"
+                        "Assistant: {{ message['content'] }}\n"
+                        "{%- endif %}\n"
+                        "{%- endfor %}\n"
+                        "{%- if add_generation_prompt %}\n"
+                        "Assistant:\n"
+                        "{%- endif %}\n"
+                    )
+                    self.chat_template = default_template
             except Exception as e:
                 print(f"Warning: Could not load tokenizer from {self.tokenizer_path}: {e}")
                 print("Chat template formatting will be disabled.")
@@ -314,26 +392,62 @@ class VLLMHttpBackend:
     async def _ensure_session(self):
         if self.session is None:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
+    
+    async def check_server_metrics(self) -> Optional[Dict[str, Any]]:
+        """Check server metrics including KV cache usage.
+        
+        Returns:
+            Dictionary with metrics if available, None otherwise
+        """
+        await self._ensure_session()
+        try:
+            # Try to get metrics from server (if available)
+            # Note: vLLM doesn't expose metrics via HTTP by default,
+            # but we can check server health and infer from response times
+            async with self.session.get(f"{self.server_url}/health", 
+                                      timeout=aiohttp.ClientTimeout(total=2)) as resp:
+                if resp.status == 200:
+                    return {"status": "healthy"}
+        except Exception as e:
+            # Server might not have metrics endpoint
+            pass
+        return None
 
     async def add_request(
         self,
-        prompt: str,
-        max_tokens: int,
-        prefix_key: Optional[str],
-        stream: bool,
-        request_id: str,
+        prompt: Optional[str] = None,
+        prompt_token_ids: Optional[List[int]] = None,
+        max_tokens: int = 128,
+        prefix_key: Optional[str] = None,
+        stream: bool = False,
+        request_id: str = "",
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ):
         """Send one request to vLLM via /v1/completions (OpenAI v0-style).
 
-        We use the text completions API because the client already applied the
-        chat template and produced a plain text prompt.
+        Can send either text prompt or prompt_token_ids. When server uses
+        --skip-tokenizer-init, must use prompt_token_ids.
+        
+        Args:
+            max_retries: Maximum number of retry attempts for transient errors
+            retry_delay: Delay between retries in seconds
         """
         await self._ensure_session()
         url = f"{self.server_url}/v1/completions"
 
+        if prompt_token_ids is not None:
+            # Send token IDs directly (required when server uses --skip-tokenizer-init)
+            prompt_field = prompt_token_ids
+        elif prompt is not None:
+            # Send text prompt (requires server to have tokenizer)
+            prompt_field = prompt
+        else:
+            raise ValueError("Either prompt or prompt_token_ids must be provided")
+
         payload: Dict[str, Any] = {
             "model": self.model,
-            "prompt": prompt,
+            "prompt": prompt_field,
             "max_tokens": max_tokens,
             # 這是 OpenAI v0 的 field，vLLM 也支援
             "stream": stream,
@@ -346,15 +460,65 @@ class VLLMHttpBackend:
         if extra_body:
             payload["extra_body"] = extra_body
 
-        async with self.session.post(url, json=payload) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(
-                    f"vLLM request failed: status={resp.status}, body={text}"
-                )
-            data = await resp.json()
-            self.finished_requests += 1
-            return data
+        last_exception = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with self.session.post(url, json=payload) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        error_msg = f"vLLM request failed: status={resp.status}, body={text[:500]}"
+                        
+                        # Check if server is still alive
+                        if resp.status in (502, 503, 504):
+                            # Bad Gateway, Service Unavailable, Gateway Timeout
+                            # These might be transient, retry
+                            if attempt < max_retries:
+                                await asyncio.sleep(retry_delay * (attempt + 1))
+                                continue
+                            else:
+                                raise RuntimeError(
+                                    f"{error_msg} (Server may be down or overloaded)"
+                                )
+                        else:
+                            # Other errors (400, 500, etc.) are likely permanent
+                            raise RuntimeError(error_msg)
+                    
+                    data = await resp.json()
+                    self.finished_requests += 1
+                    return data
+                    
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                # Network errors or timeouts - retry
+                last_exception = e
+                if attempt < max_retries:
+                    error_type = type(e).__name__
+                    error_msg = str(e) if str(e) else f"{error_type} occurred"
+                    timeout_info = f" (timeout={self.timeout.total}s)" if isinstance(e, asyncio.TimeoutError) else ""
+                    print(f"Warning: {error_type} on attempt {attempt + 1}/{max_retries + 1} "
+                          f"for request {request_id}: {error_msg}{timeout_info}. Retrying in {retry_delay * (attempt + 1):.1f}s...")
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+                else:
+                    # Check if server is reachable
+                    try:
+                        async with self.session.get(f"{self.server_url}/health", timeout=aiohttp.ClientTimeout(total=5)) as health_resp:
+                            if health_resp.status == 200:
+                                raise RuntimeError(
+                                    f"Request failed after {max_retries + 1} attempts: {e}. "
+                                    f"Server is reachable but request failed."
+                                )
+                            else:
+                                raise RuntimeError(
+                                    f"Request failed after {max_retries + 1} attempts: {e}. "
+                                    f"Server health check returned status {health_resp.status}."
+                                )
+                    except Exception as health_check_error:
+                        raise RuntimeError(
+                            f"Request failed after {max_retries + 1} attempts: {e}. "
+                            f"Server appears to be unreachable: {health_check_error}"
+                        )
+        
+        # Should not reach here, but just in case
+        raise RuntimeError(f"Request failed after {max_retries + 1} attempts: {last_exception}")
 
     async def finalize(self):
         """Cleanup resources."""
@@ -381,18 +545,29 @@ class ClientSimulator:
                  simulator_backend: VLLMHttpBackend,
                  chat_formatter: ChatTemplateFormatter,
                  timing_simulator: TimingSimulator,
-                 max_tokens_per_request: int = 128):
+                 max_tokens_per_request: int = 128,
+                 max_concurrent_requests: int = 50,
+                 requests_per_second: Optional[float] = None):
         """
         Args:
             simulator_backend: The simulator backend to send requests to
             chat_formatter: Chat template formatter
             timing_simulator: Timing simulator for request arrival
             max_tokens_per_request: Maximum tokens to generate per request
+            max_concurrent_requests: Maximum number of concurrent requests
+            requests_per_second: Rate limit in requests per second (None = no limit)
         """
         self.backend = simulator_backend
         self.chat_formatter = chat_formatter
         self.timing = timing_simulator
         self.max_tokens = max_tokens_per_request
+        
+        # Concurrency control
+        self.semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self.rate_limit_interval = None
+        self.last_request_time = 0.0
+        if requests_per_second is not None and requests_per_second > 0:
+            self.rate_limit_interval = 1.0 / requests_per_second
         
         # Statistics
         self.stats = {
@@ -400,7 +575,13 @@ class ClientSimulator:
             "completed_requests": 0,
             "failed_requests": 0,
             "total_latency_ms": 0.0,
+            "rate_limited_requests": 0,
+            "concurrency_limited_requests": 0,
         }
+        
+        # Memory monitoring
+        self.last_kv_cache_check = 0
+        self.kv_cache_check_interval = 30.0  # Check every 30 seconds
     
     async def replay_conversations(self, 
                                    conversations: List[ShareGPTConversation],
@@ -480,89 +661,125 @@ class ClientSimulator:
                 user_indices = all_user_indices
             
             for user_idx in user_indices:
-                # Get conversation context up to this user message
-                context_messages = messages[:user_idx + 1]
+                # Rate limiting (simple time-based)
+                if self.rate_limit_interval is not None:
+                    current_time = time.time()
+                    time_since_last = current_time - self.last_request_time
+                    if time_since_last < self.rate_limit_interval:
+                        await asyncio.sleep(self.rate_limit_interval - time_since_last)
+                        self.stats["rate_limited_requests"] += 1
+                    self.last_request_time = time.time()
                 
-                # Format the prompt (已經是 v0 的 plain text prompt)
-                prompt = self.chat_formatter.format_conversation(
-                    context_messages,
-                    add_generation_prompt=True
-                )
-                
-                # Generate prefix key if prefix sharing is enabled
-                prefix_key = None
-                if prefix_sharing:
-                    prefix_key = self.chat_formatter.get_prefix_key(
+                # Concurrency limiting
+                async with self.semaphore:
+                    # Periodic server health check
+                    current_time = time.time()
+                    if current_time - self.last_kv_cache_check > self.kv_cache_check_interval:
+                        metrics = await self.backend.check_server_metrics()
+                        if metrics:
+                            # Log server status periodically
+                            print(f"[Monitor] Server status: {metrics.get('status', 'unknown')}")
+                        self.last_kv_cache_check = current_time
+                    self.stats["concurrency_limited_requests"] += 1
+                    
+                    # Get conversation context up to this user message
+                    context_messages = messages[:user_idx + 1]
+                    
+                    # Format the prompt (已經是 v0 的 plain text prompt)
+                    prompt = self.chat_formatter.format_conversation(
                         context_messages,
-                        use_full_conversation=use_full_conversation_prefix
+                        add_generation_prompt=True
                     )
-
-                # =====================
-                # 這一段是新加的：用 tokenizer 控制 context 長度
-                # =====================
-                max_context_tokens = 2048
-                # 先用 argparse 給的 max_tokens，再 clamp 一次
-                new_tokens = min(self.max_tokens, 512)
-
-                tokenizer = self.chat_formatter.tokenizer
-                if tokenizer is not None:
-                    enc = tokenizer(
-                        prompt,
-                        add_special_tokens=False,
-                        return_attention_mask=False,
-                        return_token_type_ids=False,
-                    )
-                    input_ids = enc["input_ids"]
-                    total_tokens = len(input_ids) + new_tokens
-
-                    if total_tokens > max_context_tokens:
-                        # 允許的最大 prompt token 數量
-                        allowed_input = max_context_tokens - new_tokens
-                        if allowed_input <= 0:
-                            # 最壞情況：至少保留 1 個輸入 token + 1 個輸出 token
-                            allowed_input = max_context_tokens - 1
-                            new_tokens = 1
-
-                        # 只保留最後 allowed_input 個 token，對 prefix sharing 也合理
-                        input_ids = input_ids[-allowed_input:]
-                        prompt = tokenizer.decode(
-                            input_ids,
-                            skip_special_tokens=True,
-                            clean_up_tokenization_spaces=True,
+                    
+                    # Generate prefix key if prefix sharing is enabled
+                    prefix_key = None
+                    if prefix_sharing:
+                        prefix_key = self.chat_formatter.get_prefix_key(
+                            context_messages,
+                            use_full_conversation=use_full_conversation_prefix
                         )
-                else:
-                    # fallback：tokenizer 載不到時，用很保守的 word-based 近似
-                    approx_limit = 512
-                    words = prompt.split()
-                    if len(words) > approx_limit:
-                        words = words[-approx_limit:]
-                        prompt = " ".join(words)
-                        # 這種情況也把 new_tokens 壓小一點
-                        new_tokens = min(new_tokens, 128)
-                # =====================
 
-                # Submit request
-                request_id = f"{conversation.conversation_id}_turn_{user_idx}"
-                start_time = time.time()
-                
-                try:
-                    await self.backend.add_request(
-                        prompt=prompt,
-                        max_tokens=new_tokens,
-                        prefix_key=prefix_key,
-                        stream=False,  # v0 style，拿完整回應就好
-                        request_id=request_id,
-                    )
+                    # =====================
+                    # 這一段是新加的：用 tokenizer 控制 context 長度
+                    # =====================
+                    max_context_tokens = 2048
+                    # 先用 argparse 給的 max_tokens，再 clamp 一次
+                    new_tokens = min(self.max_tokens, 512)
+
+                    tokenizer = self.chat_formatter.tokenizer
+                    prompt_token_ids = None
+                    if tokenizer is not None:
+                        enc = tokenizer(
+                            prompt,
+                            add_special_tokens=False,
+                            return_attention_mask=False,
+                            return_token_type_ids=False,
+                        )
+                        input_ids = enc["input_ids"]
+                        total_tokens = len(input_ids) + new_tokens
+
+                        if total_tokens > max_context_tokens:
+                            # 允許的最大 prompt token 數量
+                            allowed_input = max_context_tokens - new_tokens
+                            if allowed_input <= 0:
+                                # 最壞情況：至少保留 1 個輸入 token + 1 個輸出 token
+                                allowed_input = max_context_tokens - 1
+                                new_tokens = 1
+
+                            # 只保留最後 allowed_input 個 token，對 prefix sharing 也合理
+                            input_ids = input_ids[-allowed_input:]
+                        
+                        # Use token_ids directly (required when server uses --skip-tokenizer-init)
+                        prompt_token_ids = input_ids
+                    else:
+                        # fallback：tokenizer 載不到時，用很保守的 word-based 近似
+                        # 但這會失敗如果 server 使用 --skip-tokenizer-init
+                        approx_limit = 512
+                        words = prompt.split()
+                        if len(words) > approx_limit:
+                            words = words[-approx_limit:]
+                            prompt = " ".join(words)
+                            # 這種情況也把 new_tokens 壓小一點
+                            new_tokens = min(new_tokens, 128)
+                    # =====================
+
+                    # Submit request
+                    request_id = f"{conversation.conversation_id}_turn_{user_idx}"
+                    start_time = time.time()
                     
-                    self.stats["total_requests"] += 1
-                    self.stats["completed_requests"] += 1
-                    latency_ms = (time.time() - start_time) * 1000
-                    self.stats["total_latency_ms"] += latency_ms
-                    
-                except Exception as e:
-                    print(f"Error submitting request {request_id}: {e}")
-                    self.stats["total_requests"] += 1
-                    self.stats["failed_requests"] += 1
+                    try:
+                        await self.backend.add_request(
+                            prompt=prompt if prompt_token_ids is None else None,
+                            prompt_token_ids=prompt_token_ids,
+                            max_tokens=new_tokens,
+                            prefix_key=prefix_key,
+                            stream=False,  # v0 style，拿完整回應就好
+                            request_id=request_id,
+                        )
+                        
+                        self.stats["total_requests"] += 1
+                        self.stats["completed_requests"] += 1
+                        latency_ms = (time.time() - start_time) * 1000
+                        self.stats["total_latency_ms"] += latency_ms
+                        
+                    except Exception as e:
+                        error_type = type(e).__name__
+                        error_msg = str(e)
+                        print(f"Error submitting request {request_id}: [{error_type}] {error_msg}")
+                        
+                        # Check if it's a server connectivity issue
+                        if "unreachable" in error_msg.lower() or "connection" in error_msg.lower():
+                            print(f"  -> Server connectivity issue detected. "
+                                  f"Check if server is still running.")
+                        elif "status=" in error_msg:
+                            print(f"  -> Server returned an error status. "
+                                  f"Check server logs for details.")
+                        
+                        self.stats["total_requests"] += 1
+                        self.stats["failed_requests"] += 1
+                        
+                        # If server appears to be down, we might want to stop processing
+                        # But for now, continue with other requests
         
         except Exception as e:
             print(f"Error processing conversation {conversation.conversation_id}: {e}")
@@ -577,7 +794,9 @@ class ClientSimulator:
             **self.stats,
             "avg_latency_ms": avg_latency,
             "success_rate": (self.stats["completed_requests"] / self.stats["total_requests"]
-                           if self.stats["total_requests"] > 0 else 0.0)
+                           if self.stats["total_requests"] > 0 else 0.0),
+            "rate_limited_count": self.stats.get("rate_limited_requests", 0),
+            "concurrency_limited_count": self.stats.get("concurrency_limited_requests", 0),
         }
 
 
@@ -627,6 +846,15 @@ async def main():
     # Request options
     parser.add_argument("--max-tokens", type=int, default=128,
                        help="Maximum tokens to generate per request")
+    parser.add_argument("--request-timeout", type=float, default=300.0,
+                       help="Request timeout in seconds (default: 300s = 5min). "
+                            "Increase for longer generations or slow servers.")
+    parser.add_argument("--max-concurrent-requests", type=int, default=50,
+                       help="Maximum number of concurrent requests (default: 50). "
+                            "Reduce if server runs out of memory.")
+    parser.add_argument("--requests-per-second", type=float, default=None,
+                       help="Rate limit in requests per second (default: None = no limit). "
+                            "Useful to prevent overwhelming the server.")
     parser.add_argument("--prefix-sharing", action="store_true", default=True,
                        help="Enable prefix sharing (client side key generation)")
     parser.add_argument("--no-prefix-sharing", dest="prefix_sharing",
@@ -665,16 +893,28 @@ async def main():
         poisson_lambda=args.poisson_lambda
     )
     
+    # Calculate dynamic timeout based on max_tokens if not explicitly set
+    # Rough estimate: ~0.1s per token for generation + 5s base overhead
+    base_timeout = args.request_timeout
+    if base_timeout == 300.0:  # Using default
+        estimated_timeout = max(60.0, 5.0 + args.max_tokens * 0.1)
+        timeout = max(base_timeout, estimated_timeout)
+    else:
+        timeout = base_timeout
+    
     backend = VLLMHttpBackend(
         server_url=args.server_url,
         model=backend_model_name,
+        timeout=timeout,
     )
     
     client_simulator = ClientSimulator(
         simulator_backend=backend,
         chat_formatter=chat_formatter,
         timing_simulator=timing_simulator,
-        max_tokens_per_request=args.max_tokens
+        max_tokens_per_request=args.max_tokens,
+        max_concurrent_requests=args.max_concurrent_requests,
+        requests_per_second=args.requests_per_second
     )
     
     # Run simulation

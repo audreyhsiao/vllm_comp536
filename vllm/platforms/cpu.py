@@ -87,8 +87,9 @@ class CpuPlatform(Platform):
             model_config.dtype = torch.bfloat16
 
         parallel_config = vllm_config.parallel_config
+        # Allow "sim" backend on CPU (SimulatorExecutor doesn't need actual workers)
         if (parallel_config.distributed_executor_backend is not None
-                and parallel_config.distributed_executor_backend != "mp"):
+                and parallel_config.distributed_executor_backend not in ("mp", "sim")):
             logger.warning(("%s is not supported on CPU, fallback to mp "
                             "distributed executor backend."),
                            parallel_config.distributed_executor_backend)

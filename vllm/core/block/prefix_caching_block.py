@@ -462,6 +462,7 @@ class PrefixCachingBlockAllocator(BlockAllocator):
             # Mark this block as touched so that it can be marked as
             # computed after the entire batch of sequences are scheduled.
             self._touched_blocks.add(block.block_id)
+            print(f"[prefix-debug] promote_to_immutable_block: added block_id={block.block_id} to _cached_blocks (hash={block.content_hash}), _touched_blocks size={len(self._touched_blocks)}")
             return block.block_id
 
         # Reuse the cached content hash
@@ -528,6 +529,8 @@ class PrefixCachingBlockAllocator(BlockAllocator):
 
     def mark_blocks_as_computed(self, block_ids: List[int]) -> None:
         # Mark all touched blocks as computed.
+        if self._touched_blocks:
+            print(f"[prefix-debug] mark_blocks_as_computed: marking {len(self._touched_blocks)} blocks as computed: {list(self._touched_blocks)}")
         for block_id in self._touched_blocks:
             self._block_tracker[block_id].computed = True
         self._touched_blocks.clear()

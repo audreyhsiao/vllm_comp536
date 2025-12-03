@@ -257,7 +257,7 @@ class OpenAIServing:
     def _normalize_prompt_tokens_to_input(
         self,
         request: AnyRequest,
-        tokenizer: AnyTokenizer,
+        tokenizer: Optional[AnyTokenizer],
         prompt_ids: List[int],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]],
     ) -> TextTokensPrompt:
@@ -266,7 +266,8 @@ class OpenAIServing:
         else:
             input_ids = prompt_ids[-truncate_prompt_tokens:]
 
-        input_text = tokenizer.decode(input_ids)
+        # If tokenizer is None (skip_tokenizer_init), use empty string for prompt text
+        input_text = tokenizer.decode(input_ids) if tokenizer is not None else ""
 
         return self._validate_input(request, input_ids, input_text)
 
@@ -374,7 +375,7 @@ class OpenAIServing:
     def _tokenize_prompt_input_or_inputs(
         self,
         request: AnyRequest,
-        tokenizer: AnyTokenizer,
+        tokenizer: Optional[AnyTokenizer],
         input_or_inputs: Union[str, List[str], List[int], List[List[int]]],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         add_special_tokens: bool = True,
@@ -409,7 +410,7 @@ class OpenAIServing:
     async def _preprocess_completion(
         self,
         request: CompletionLikeRequest,
-        tokenizer: AnyTokenizer,
+        tokenizer: Optional[AnyTokenizer],
         input_or_inputs: Union[str, List[str], List[int], List[List[int]]],
         truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None,
         add_special_tokens: bool = True,
@@ -510,8 +511,10 @@ class OpenAIServing:
             # For MistralTokenizer
             assert is_list_of(request_prompt, int), (
                 "Prompt has to be either a string or a list of token ids")
+            # If tokenizer is None (skip_tokenizer_init), use empty string for prompt text
+            prompt_text = tokenizer.decode(request_prompt) if tokenizer is not None else ""
             prompt_inputs = TextTokensPrompt(
-                prompt=tokenizer.decode(request_prompt),
+                prompt=prompt_text,
                 prompt_token_ids=request_prompt)
 
         engine_prompt = TokensPrompt(
