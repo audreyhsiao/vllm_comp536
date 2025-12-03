@@ -18,6 +18,4 @@ python -m vllm.entrypoints.openai.api_server \
   --disable-log-requests \
   --skip-tokenizer-init \
   --disable-frontend-multiprocessing \
-  --block-size 8 \
-  --num-gpu-blocks-override 1024 \
-  --gpu-memory-utilization 0.9
+  --eviction-policy lru

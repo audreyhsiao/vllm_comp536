@@ -12,6 +12,7 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
+from vllm.core.evictor import EvictionPolicy
 from vllm.utils import Device
 
 # 新增：prefix sharing 統計收集器
@@ -69,10 +70,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
         enable_caching: bool = False,
+        eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        self.eviction_policy = eviction_policy
 
         # 告訴 prefix stats collector 目前的 block_size
         global_prefix_collector.set_block_size(self.block_size)
@@ -102,6 +105,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=block_size,
+            eviction_policy=eviction_policy,
         )
 
         self.block_tables: Dict[SeqId, BlockTable] = {}
