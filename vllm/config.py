@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (QUANTIZATION_METHODS,
                                                      get_quantization_config)
 from vllm.model_executor.models import ModelRegistry
+from vllm.core.evictor import EvictionPolicy
 from vllm.platforms import current_platform, interface
 from vllm.tracing import is_otel_available, otel_import_error_traceback
 from vllm.transformers_utils.config import (
@@ -963,6 +964,7 @@ class CacheConfig:
             prefix caching enabled.
         enable_prefix_caching: Whether to enable prefix caching.
         cpu_offload_gb: Size of the CPU offload buffer in GiB.
+        eviction_policy: Eviction strategy for prefix cache eviction.
     """
 
     def compute_hash(self) -> str:
@@ -979,6 +981,7 @@ class CacheConfig:
         """
         factors: List[Any] = []
         factors.append(self.cache_dtype)
+        factors.append(self.eviction_policy)
         # `cpu_offload_gb` does not use `torch.compile` yet.
         hash_str = hashlib.md5(str(factors).encode()).hexdigest()
         return hash_str
@@ -994,6 +997,7 @@ class CacheConfig:
         sliding_window: Optional[int] = None,
         enable_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
+        eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization
@@ -1004,6 +1008,7 @@ class CacheConfig:
         self.sliding_window = sliding_window
         self.enable_prefix_caching = enable_prefix_caching
         self.cpu_offload_gb = cpu_offload_gb
+        self.eviction_policy = eviction_policy
 
         self._verify_args()
         self._verify_cache_dtype()

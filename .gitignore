@@ -226,3 +226,7 @@ sim/*_sharegpt.json
 
 # Datasets
 workload_datasets/qwen-bailian-usagetraces-anon
+sim/*.json
+
+figs*
+sim/dataset*

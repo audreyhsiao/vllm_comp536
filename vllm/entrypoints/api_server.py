@@ -9,9 +9,10 @@ import asyncio
 import json
 import ssl
 from argparse import Namespace
+from http import HTTPStatus
 from typing import Any, AsyncGenerator, Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -29,6 +30,7 @@ logger = init_logger("vllm.entrypoints.api_server")
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 app = FastAPI()
 engine = None
+MAX_REQUEST_SIZE = 50 * 1024 * 1024  # Default: 50MB
 
 
 @app.get("/health")
@@ -46,7 +48,48 @@ async def generate(request: Request) -> Response:
     - stream: whether to stream the results or not.
     - other fields: the sampling parameters (See `SamplingParams` for details).
     """
-    request_dict = await request.json()
+    # Check Content-Length header first to avoid loading large requests
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            size = int(content_length)
+            if size > MAX_REQUEST_SIZE:
+                logger.warning(
+                    f"Request too large: {size} bytes (max: {MAX_REQUEST_SIZE})")
+                raise HTTPException(
+                    status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Request body too large: {size} bytes. "
+                           f"Maximum allowed size: {MAX_REQUEST_SIZE} bytes"
+                )
+        except ValueError:
+            # Invalid content-length, continue to try parsing
+            pass
+
+    # Read body in chunks with size limit to prevent OOM
+    body_bytes = b""
+    total_size = 0
+    async for chunk in request.stream():
+        total_size += len(chunk)
+        if total_size > MAX_REQUEST_SIZE:
+            logger.warning(
+                f"Request body too large: {total_size} bytes "
+                f"(max: {MAX_REQUEST_SIZE})")
+            raise HTTPException(
+                status_code=HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Request body too large: {total_size} bytes. "
+                       f"Maximum allowed size: {MAX_REQUEST_SIZE} bytes"
+            )
+        body_bytes += chunk
+
+    # Parse JSON from bytes
+    try:
+        request_dict = json.loads(body_bytes)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=f"Invalid JSON: {str(e)}"
+        )
+
     return await _generate(request_dict, raw_request=request)
 
 
@@ -91,9 +134,13 @@ async def _generate(request_dict: dict, raw_request: Request) -> Response:
 
 
 def build_app(args: Namespace) -> FastAPI:
-    global app
+    global app, MAX_REQUEST_SIZE
 
     app.root_path = args.root_path
+    # Update max request size from args (argparse converts --max-request-size to max_request_size)
+    if hasattr(args, 'max_request_size'):
+        MAX_REQUEST_SIZE = args.max_request_size
+        logger.info(f"Maximum request size set to {MAX_REQUEST_SIZE} bytes")
     return app
 
 
@@ -160,6 +207,11 @@ if __name__ == "__main__":
         default=None,
         help="FastAPI root_path when app is behind a path based routing proxy")
     parser.add_argument("--log-level", type=str, default="debug")
+    parser.add_argument(
+        "--max-request-size",
+        type=int,
+        default=50 * 1024 * 1024,  # 50MB default
+        help="Maximum request body size in bytes (default: 50MB)")
     parser = AsyncEngineArgs.add_cli_args(parser)
     args = parser.parse_args()
 

@@ -22,6 +22,7 @@ from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 from vllm.platforms import current_platform
 from vllm.transformers_utils.utils import check_gguf_file
 from vllm.usage.usage_lib import UsageContext
+from vllm.core.evictor import EvictionPolicy
 from vllm.utils import FlexibleArgumentParser, StoreBoolean
 
 if TYPE_CHECKING:
@@ -41,6 +42,8 @@ DEVICE_OPTIONS = [
     "xpu",
     "hpu",
 ]
+
+EVICTION_POLICY_CHOICES = [policy.name.lower() for policy in EvictionPolicy]
 
 
 def nullable_str(val: str):
@@ -123,6 +126,7 @@ class EngineArgs:
     disable_sliding_window: bool = False
     use_v2_block_manager: bool = True
     swap_space: float = 4  # GiB
+    eviction_policy: str = "lru"
     cpu_offload_gb: float = 0  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
@@ -485,6 +489,12 @@ class EngineArgs:
                             type=float,
                             default=EngineArgs.swap_space,
                             help='CPU swap space size (GiB) per GPU.')
+        parser.add_argument('--eviction-policy',
+                            type=str,
+                            choices=EVICTION_POLICY_CHOICES,
+                            default=EngineArgs.eviction_policy,
+                            help='Eviction policy for prefix cache when '
+                            'enabled. Supported values: lru, lfu, fifo.')
         parser.add_argument(
             '--cpu-offload-gb',
             type=float,
@@ -1070,6 +1080,13 @@ class EngineArgs:
                            "has been disabled.")
             self.enable_prefix_caching = False
 
+        try:
+            eviction_policy = EvictionPolicy[self.eviction_policy.upper()]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unsupported eviction policy: {self.eviction_policy}"
+            ) from exc
+
         cache_config = CacheConfig(
             block_size=self.block_size,
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -1080,6 +1097,7 @@ class EngineArgs:
             sliding_window=model_config.get_sliding_window(),
             enable_prefix_caching=self.enable_prefix_caching,
             cpu_offload_gb=self.cpu_offload_gb,
+            eviction_policy=eviction_policy,
         )
         parallel_config = ParallelConfig(
             pipeline_parallel_size=self.pipeline_parallel_size,

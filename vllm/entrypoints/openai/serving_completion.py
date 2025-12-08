@@ -103,7 +103,19 @@ class OpenAIServingCompletion(OpenAIServing):
                 prompt_adapter_request,
             ) = self._maybe_get_adapters(request)
 
-            tokenizer = await self.engine_client.get_tokenizer(lora_request)
+            # Check if prompt is token IDs
+            from vllm.utils import is_list_of
+            is_token_ids = (isinstance(request.prompt, list) and 
+                           (is_list_of(request.prompt, int) or 
+                            (isinstance(request.prompt, list) and 
+                             len(request.prompt) > 0 and 
+                             is_list_of(request.prompt[0], int))))
+            
+            # Only get tokenizer if we need it
+            # If skip_tokenizer_init=True and prompt is token IDs, we don't need tokenizer
+            tokenizer = None
+            if not (self.model_config.skip_tokenizer_init and is_token_ids):
+                tokenizer = await self.engine_client.get_tokenizer(lora_request)
 
             request_prompts, engine_prompts = await self._preprocess_completion(
                 request,

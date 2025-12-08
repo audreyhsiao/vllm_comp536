@@ -1,4 +1,5 @@
 """A block manager that manages token blocks."""
+import time
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
@@ -11,6 +12,7 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
+from vllm.core.evictor import EvictionPolicy
 from vllm.utils import Device
 
 # 新增：prefix sharing 統計收集器
@@ -68,10 +70,12 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         watermark: float = 0.01,
         sliding_window: Optional[int] = None,
         enable_caching: bool = False,
+        eviction_policy: EvictionPolicy = EvictionPolicy.LRU,
     ) -> None:
         self.block_size = block_size
         self.num_total_gpu_blocks = num_gpu_blocks
         self.num_total_cpu_blocks = num_cpu_blocks
+        self.eviction_policy = eviction_policy
 
         # 告訴 prefix stats collector 目前的 block_size
         global_prefix_collector.set_block_size(self.block_size)
@@ -101,6 +105,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             block_size=block_size,
+            eviction_policy=eviction_policy,
         )
 
         self.block_tables: Dict[SeqId, BlockTable] = {}
@@ -177,6 +182,39 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # NOTE: Here we assume that all sequences in the group have the same
         # prompt.
         seq = waiting_seqs[0]
+        
+        # ⭐ NEW: 在分配之前，記錄所有已存在的 cached block_ids
+        # 這樣我們可以區分哪些 blocks 是從 cache 中 hit 的，哪些是新分配的
+        # 注意：我們記錄的是 block_ids，因為在 allocate_immutable_block 中，
+        # 當找到 cached block 時，會設置 block.block_id = cached_block_id
+        # 注意：CpuGpuBlockAllocator 是包裝器，_cached_blocks 在內部的 gpu_block_allocator 或 cpu_block_allocator 中
+        existing_cached_block_ids = set()
+        if self.enable_caching:
+            # 檢查 CpuGpuBlockAllocator 的內部 allocators
+            if hasattr(self.block_allocator, '_allocators'):
+                # CpuGpuBlockAllocator 有 _allocators 字典
+                for device, allocator in self.block_allocator._allocators.items():
+                    if hasattr(allocator, '_cached_blocks'):
+                        # 只記錄已經被標記為 computed 的 blocks
+                        # 注意：blocks 只有在被標記為 computed 後才會被認為是 "cached"
+                        for content_hash, block_id in allocator._cached_blocks.items():
+                            try:
+                                if allocator.block_is_computed(block_id):
+                                    existing_cached_block_ids.add(block_id)
+                            except (AttributeError, KeyError):
+                                # 如果 block_is_computed 方法不存在或 block_id 不存在，跳過
+                                pass
+            elif hasattr(self.block_allocator, '_cached_blocks'):
+                # 直接是 PrefixCachingBlockAllocator
+                for content_hash, block_id in self.block_allocator._cached_blocks.items():
+                    try:
+                        if self.block_allocator.block_is_computed(block_id):
+                            existing_cached_block_ids.add(block_id)
+                    except (AttributeError, KeyError):
+                        # 如果 block_is_computed 方法不存在或 block_id 不存在，跳過
+                        pass
+        # ⭐ NEW 結束
+        
         block_table: BlockTable = self._allocate_sequence(seq)
         self.block_tables[seq.seq_id] = block_table
 
@@ -195,6 +233,56 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # NOTE: Here we assume that all sequences in the group have the same
         # encoder prompt.
         request_id = seq_group.request_id
+        
+        # ⭐ NEW: 記錄真正的 cache hit blocks
+        # 在分配完 blocks 後，檢查哪些 blocks 是從 cache 中 hit 的
+        # 方法：檢查 block 的 content_hash 是否在分配前就已經在 _cached_blocks 中
+        # 並且該 block 已經被標記為 computed
+        if self.enable_caching and request_id:
+            hit_block_ids = []
+            block_table = self.block_tables[waiting_seqs[0].seq_id]
+            
+            # 獲取所有 allocators 的 _cached_blocks
+            cached_blocks_by_hash = {}
+            if hasattr(self.block_allocator, '_allocators'):
+                for device, allocator in self.block_allocator._allocators.items():
+                    if hasattr(allocator, '_cached_blocks'):
+                        for content_hash, block_id in allocator._cached_blocks.items():
+                            try:
+                                if allocator.block_is_computed(block_id):
+                                    cached_blocks_by_hash[content_hash] = block_id
+                            except (AttributeError, KeyError):
+                                pass
+            elif hasattr(self.block_allocator, '_cached_blocks'):
+                for content_hash, block_id in self.block_allocator._cached_blocks.items():
+                    try:
+                        if self.block_allocator.block_is_computed(block_id):
+                            cached_blocks_by_hash[content_hash] = block_id
+                    except (AttributeError, KeyError):
+                        pass
+            
+            # 檢查每個 block 是否是從 cache 中 hit 的
+            for block in block_table.blocks:
+                if block.block_id is not None and hasattr(block, 'content_hash') and block.content_hash is not None:
+                    # 如果 block 的 content_hash 在分配前就已經在 _cached_blocks 中，
+                    # 並且 block.block_id 匹配，那麼它是從 cache 中 hit 的
+                    if block.content_hash in cached_blocks_by_hash:
+                        cached_block_id = cached_blocks_by_hash[block.content_hash]
+                        if block.block_id == cached_block_id:
+                            hit_block_ids.append(block.block_id)
+            
+            # 記錄 hit 的 blocks
+            if hit_block_ids:
+                global_prefix_collector.record_hit(
+                    request_id=request_id,
+                    block_ids=hit_block_ids,
+                )
+            # Debug: 打印一些信息来确认逻辑是否正确执行
+            print(f"[prefix-debug] request_id={request_id}, enable_caching={self.enable_caching}, "
+                  f"existing_cached_block_ids={len(existing_cached_block_ids)}, "
+                  f"cached_blocks_by_hash={len(cached_blocks_by_hash)}, "
+                  f"num_blocks={len(block_table.blocks)}, hit_block_ids={hit_block_ids}")
+        # ⭐ NEW 結束
 
         assert (request_id
                 not in self.cross_block_tables), \

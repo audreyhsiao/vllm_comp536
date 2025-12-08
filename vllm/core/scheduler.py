@@ -362,7 +362,8 @@ class Scheduler:
             num_gpu_blocks=num_gpu_blocks,
             num_cpu_blocks=num_cpu_blocks,
             sliding_window=self.cache_config.sliding_window,
-            enable_caching=self.cache_config.enable_prefix_caching)
+            enable_caching=self.cache_config.enable_prefix_caching,
+            eviction_policy=self.cache_config.eviction_policy)
 
         # Sequence groups in the WAITING state.
         # Contain new prefill or preempted requests.
@@ -1338,17 +1339,16 @@ class Scheduler:
                 block_tables[seq_id] = self.block_manager.get_block_table(seq)
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
+            # 計算 common_computed_block_nums（用於 attention backend）
+            # 但不在這裡記錄 hit，因為 common_computed_block_nums 包含所有 computed blocks，
+            # 而不仅仅是真正从 cache 中 hit 的 blocks。
+            # 真正的 cache hit 应该在 block_manager.allocate 时记录。
             if self.cache_config.enable_prefix_caching:
                 common_computed_block_nums = (
                     self.block_manager.get_common_computed_block_ids(
                         seq_group.get_seqs(status=SequenceStatus.RUNNING)))
-                if common_computed_block_nums:
-                    request_id = getattr(seq_group, "request_id", None)
-                    global_prefix_collector.record_hit(
-                        request_id=request_id,
-                        block_ids=common_computed_block_nums,
-                        timestamp=time.time(),
-                    )
+            else:
+                common_computed_block_nums = []
 
 
             do_sample = True

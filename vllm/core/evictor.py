@@ -9,6 +9,8 @@ class EvictionPolicy(enum.Enum):
        Evictor subclass.
     """
     LRU = enum.auto()
+    LFU = enum.auto()
+    FIFO = enum.auto()
 
 
 class Evictor(ABC):
@@ -66,6 +68,8 @@ class BlockMetaData:
         self.content_hash = content_hash
         self.num_hashed_tokens = num_hashed_tokens
         self.last_accessed = last_accessed
+        # NEW: 記錄被 access 的次數（LFU 用）
+        self.access_count: int = 1
 
 
 class LRUEvictor(Evictor):
@@ -146,9 +150,152 @@ class LRUEvictor(Evictor):
     def num_blocks(self) -> int:
         return len(self.free_table)
 
+class LFUEvictor(Evictor):
+    """Evicts the Least Frequently Used block.
+    Primary key: access_count (smaller is evicted first)
+    Tie-breaker: last_accessed (older is evicted first)
+    """
+
+    CLEANUP_THRESHOLD = 50
+
+    def __init__(self):
+        self.free_table: Dict[int, BlockMetaData] = {}
+        # (access_count, last_accessed, block_id, content_hash)
+        self.priority_queue: List[Tuple[int, float, int, int]] = []
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
+
+    def evict(self) -> Tuple[int, int]:
+        if len(self.free_table) == 0:
+            raise ValueError("No usable cache memory left")
+
+        while self.priority_queue:
+            access_count, last_accessed, block_id, content_hash = heapq.heappop(
+                self.priority_queue
+            )
+            meta = self.free_table.get(block_id)
+            # 濾掉舊 entry：不在 free_table 或 meta 已經更新過
+            if meta is not None and \
+               meta.access_count == access_count and \
+               meta.last_accessed == last_accessed:
+                self.free_table.pop(block_id)
+                return block_id, content_hash
+
+        raise ValueError("No usable cache memory left")
+
+    def add(self, block_id: int, content_hash: int,
+            num_hashed_tokens: int, last_accessed: float):
+        meta = BlockMetaData(content_hash, num_hashed_tokens, last_accessed)
+        meta.access_count = 1  # 新加入視為第一次使用
+        self.free_table[block_id] = meta
+        heapq.heappush(
+            self.priority_queue,
+            (meta.access_count, meta.last_accessed, block_id, content_hash),
+        )
+        self._cleanup_if_necessary()
+
+    def update(self, block_id: int, last_accessed: float):
+        meta = self.free_table.get(block_id)
+        if meta is None:
+            return
+        meta.access_count += 1
+        meta.last_accessed = last_accessed
+        # 丟入新的狀態（舊的會在 evict 時被濾掉）
+        heapq.heappush(
+            self.priority_queue,
+            (meta.access_count, meta.last_accessed, block_id,
+             meta.content_hash),
+        )
+        self._cleanup_if_necessary()
+
+    def remove(self, block_id: int):
+        if block_id not in self.free_table:
+            raise ValueError(
+                "Attempting to remove block that's not in the evictor"
+            )
+        self.free_table.pop(block_id)
+
+    def _cleanup_if_necessary(self):
+        if len(self.priority_queue) > self.CLEANUP_THRESHOLD * len(
+                self.free_table):
+            self._cleanup()
+
+    def _cleanup(self):
+        new_priority_queue: List[Tuple[int, float, int, int]] = []
+        for block_id, meta in self.free_table.items():
+            new_priority_queue.append(
+                (meta.access_count, meta.last_accessed, block_id,
+                 meta.content_hash)
+            )
+        heapq.heapify(new_priority_queue)
+        self.priority_queue = new_priority_queue
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.free_table)
+
+class FIFOEvictor(Evictor):
+    """Evicts blocks in First-In-First-Out order (insertion order)."""
+
+    def __init__(self):
+        self.free_table: Dict[int, BlockMetaData] = {}
+        # (insert_seq, block_id, content_hash)
+        self.priority_queue: List[Tuple[int, int]] = []
+        self._next_seq: int = 0
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
+
+    def evict(self) -> Tuple[int, int]:
+        if len(self.free_table) == 0:
+            raise ValueError("No usable cache memory left")
+
+        while self.priority_queue:
+            insert_seq, block_id = heapq.heappop(self.priority_queue)
+            meta = self.free_table.get(block_id)
+            if meta is None:
+                # 過期 entry，略過
+                continue
+
+            self.free_table.pop(block_id)
+            return block_id, meta.content_hash
+
+        raise ValueError("No usable cache memory left")
+
+    def add(self, block_id: int, content_hash: int,
+        num_hashed_tokens: int, last_accessed: float):
+        meta = BlockMetaData(content_hash, num_hashed_tokens, last_accessed)
+        self.free_table[block_id] = meta
+        self._next_seq += 1
+        heapq.heappush(self.priority_queue, (self._next_seq, block_id))
+
+    def update(self, block_id: int, last_accessed: float):
+        # FIFO 不會因 access 改變 eviction 順序，
+        # 但我們還是更新 last_accessed 以便其他地方用（比如 debug / stats）
+        meta = self.free_table.get(block_id)
+        if meta is not None:
+            meta.last_accessed = last_accessed
+
+    def remove(self, block_id: int):
+        if block_id not in self.free_table:
+            raise ValueError(
+                "Attempting to remove block that's not in the evictor"
+            )
+        self.free_table.pop(block_id)
+        # priority_queue 裡舊 entry 懶得清，evict 時會被過濾掉
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.free_table)
+
 
 def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:
     if eviction_policy == EvictionPolicy.LRU:
         return LRUEvictor()
+    elif eviction_policy == EvictionPolicy.LFU:
+        return LFUEvictor()
+    elif eviction_policy == EvictionPolicy.FIFO:
+        return FIFOEvictor()
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_policy}")
