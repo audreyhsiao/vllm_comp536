@@ -222,6 +222,10 @@ __pycache__/
 
 ShareGPT_V3_unfiltered_cleaned_split.json
 prefix_stats*.json
+sim/*_sharegpt.json
+
+# Datasets
+workload_datasets/qwen-bailian-usagetraces-anon
 sim/*.json
 
 figs*
