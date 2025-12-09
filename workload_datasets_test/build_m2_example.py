@@ -31,6 +31,7 @@ def main() -> None:
         data_path="workload_datasets_test/m2_data_agent_only.json",
         index_path="workload_datasets_test/m2_index_agent_only.jsonl",
     )
+    
 
     # # (b) Agent + Coding 混在一起
     # mixed_agent_coding = agent_examples + coding_examples

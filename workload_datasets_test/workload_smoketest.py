@@ -31,16 +31,18 @@ def describe(name: str, xs: list[StandardExample], n: int = 3) -> None:
 def main() -> None:
     
     agent_examples = load_agentbank_all()
-    describe("AgentBank", agent_examples)
+    # describe("AgentBank", agent_examples)
+    for j, msg in enumerate(agent_examples[0].conversations):
+        print(f"[{j}] ({msg.role}) {msg.content}")
 
     coding_examples = load_ccbench_standard()
-    describe("CC-Bench", coding_examples)
+    # describe("CC-Bench", coding_examples)
 
     qwenA = load_qwen_as_standard(
         "workload_datasets/qwen-bailian-usagetraces-anon/qwen_traceA_blksz_16.jsonl",
         workload_type="online_trace_A",
     )
-    describe("QwenTraceA", qwenA)
+    # describe("QwenTraceA", qwenA)
 
 
 if __name__ == "__main__":
