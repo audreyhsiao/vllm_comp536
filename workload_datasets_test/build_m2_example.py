@@ -12,24 +12,30 @@ from workload_datasets.export_for_m2 import export_for_m2
 
 def main() -> None:
     # 1) 載入三種 workload 的 StandardExample
-    agent_examples = load_agentbank_all()
+    # agent_examples = load_agentbank_all()
     coding_examples = load_ccbench_standard()
-    qwenA_examples = load_qwen_as_standard(
-        "workload_datasets/qwen-bailian-usagetraces-anon/qwen_traceA_blksz_16.jsonl",
-        workload_type="online_trace_A",
-    )
+    # qwenA_examples = load_qwen_as_standard(
+    #     "workload_datasets/qwen-bailian-usagetraces-anon/qwen_traceA_blksz_16.jsonl",
+    #     workload_type="online_trace_A",
+    # )
 
-    print("AgentBank:", len(agent_examples))
+    # print("AgentBank:", len(agent_examples))
     print("CC-Bench:", len(coding_examples))
-    print("QwenTraceA:", len(qwenA_examples))
+    # print("QwenTraceA:", len(qwenA_examples))
 
     # 2) 示範幾種情境
 
     # (a) 只用 AgentBank 當一個純 agent 的 M2 訓練集
+    # export_for_m2(
+    #     agent_examples,
+    #     data_path="workload_datasets_test/m2_data_agent_only.json",
+    #     index_path="workload_datasets_test/m2_index_agent_only.jsonl",
+    # )
+
     export_for_m2(
-        agent_examples,
-        data_path="workload_datasets_test/m2_data_agent_only.json",
-        index_path="workload_datasets_test/m2_index_agent_only.jsonl",
+        coding_examples,
+        data_path="workload_datasets_test/m2_data_ccbench_only.json",
+        index_path="workload_datasets_test/m2_index_ccbench_only.jsonl",
     )
     
 

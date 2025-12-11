@@ -230,3 +230,6 @@ sim/*.json
 
 figs*
 sim/dataset*
+workload_datasets_test/m2_data*
+workload_datasets_test/m2_index*
+workload_datasets_test/dataset
