@@ -19,4 +19,4 @@ python -m vllm.entrypoints.openai.api_server \
   --skip-tokenizer-init \
   --disable-frontend-multiprocessing \
   --num-gpu-blocks-override 128 \
-  --eviction-policy fifo
+  --eviction-policy workload_aware

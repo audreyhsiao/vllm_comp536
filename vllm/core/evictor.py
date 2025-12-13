@@ -1,7 +1,7 @@
 import enum
 import heapq
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 
 class EvictionPolicy(enum.Enum):
@@ -11,6 +11,7 @@ class EvictionPolicy(enum.Enum):
     LRU = enum.auto()
     LFU = enum.auto()
     FIFO = enum.auto()
+    WORKLOAD_AWARE = enum.auto() 
 
 
 class Evictor(ABC):
@@ -64,12 +65,13 @@ class BlockMetaData:
     """
 
     def __init__(self, content_hash: int, num_hashed_tokens: int,
-                 last_accessed: float):
+                 last_accessed: float, workload_type: Optional[int] = None):
         self.content_hash = content_hash
         self.num_hashed_tokens = num_hashed_tokens
         self.last_accessed = last_accessed
         # NEW: 記錄被 access 的次數（LFU 用）
         self.access_count: int = 1
+        self.workload_type: Optional[int] = workload_type
 
 
 class LRUEvictor(Evictor):
@@ -288,6 +290,131 @@ class FIFOEvictor(Evictor):
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
+    
+class WorkloadAwareEvictor(Evictor):
+    """
+    Mixed workload policy
+
+    目標：
+    - 同一 workload 內部維持類 LRU / LFU 行為
+    - 不同 workload 根據整體 cache 使用貢獻調整保護強度
+    """
+
+    def __init__(self):
+        self.free_table: Dict[int, BlockMetaData] = {}
+        # per-workload 累積 access 次數
+        self.workload_accesses: Dict[int, int] = {}
+        # 追蹤目前最大 timestamp 作為 now_step
+        self.current_time: float = 0.0
+
+    def __contains__(self, block_id: int) -> bool:
+        return block_id in self.free_table
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.free_table)
+
+    def evict(self) -> Tuple[int, int]:
+        if not self.free_table:
+            raise ValueError("No usable cache memory left")
+
+        # 計算 per-workload penalty
+        workload_penalty = self._compute_workload_penalty()
+
+        victim_id: Optional[int] = None
+        victim_score: float = float("-inf")
+
+        for block_id, meta in self.free_table.items():
+            score = self._eviction_score(meta, workload_penalty)
+            if score > victim_score:
+                victim_score = score
+                victim_id = block_id
+
+        if victim_id is None:
+            raise ValueError("No usable cache memory left")
+
+        meta = self.free_table.pop(victim_id)
+        return victim_id, meta.content_hash
+
+    def add(self, block_id: int, content_hash: int,
+            num_hashed_tokens: int, last_accessed: float,
+            workload_type: Optional[int] = None):
+        self.current_time = max(self.current_time, last_accessed)
+        meta = BlockMetaData(
+            content_hash,
+            num_hashed_tokens,
+            last_accessed,
+            workload_type=workload_type,
+        )
+        self.free_table[block_id] = meta
+        self._record_access(meta)
+
+    def update(self, block_id: int, last_accessed: float):
+        meta = self.free_table.get(block_id)
+        if meta is None:
+            return
+        self.current_time = max(self.current_time, last_accessed)
+        meta.last_accessed = last_accessed
+        meta.access_count += 1
+        self._record_access(meta)
+
+    def remove(self, block_id: int):
+        if block_id not in self.free_table:
+            raise ValueError(
+                "Attempting to remove block that's not in the evictor"
+            )
+        self.free_table.pop(block_id)
+
+    # internal helpers
+
+    def _record_access(self, meta: BlockMetaData):
+        """統計 per-workload 使用強度"""
+        if meta.workload_type is None:
+            return
+        self.workload_accesses[meta.workload_type] = \
+            self.workload_accesses.get(meta.workload_type, 0) + 1
+
+    def _compute_workload_penalty(self) -> Dict[int, float]:
+        """hit 多的 workload 給較小 penalty"""
+        if not self.workload_accesses:
+            return {}
+
+        max_access = max(self.workload_accesses.values())
+        if max_access <= 0:
+            max_access = 1
+
+        penalty: Dict[int, float] = {}
+        for w, cnt in self.workload_accesses.items():
+            importance = cnt / max_access   # 0~1, 大代表常用
+            penalty[w] = 1.0 - importance   # 0~1, 大代表容易被丟
+        return penalty
+
+    def _eviction_score(self,
+                        meta: BlockMetaData,
+                        workload_penalty: Dict[int, float]) -> float:
+        """score 越大越優先被 evict"""
+
+        # recency
+        age = max(0.0, self.current_time - meta.last_accessed)
+
+        # frequency
+        inv_freq = 1.0 / (1.0 + meta.access_count)
+
+        # prefix 長度保護（越長越不想丟）
+        size_penalty = 1.0 / max(1, meta.num_hashed_tokens)
+
+        # workload 層級 penalty
+        wl_pen = 1.0
+        if meta.workload_type is not None:
+            wl_pen = workload_penalty.get(meta.workload_type, 1.0)
+
+        # 係數可以調，這裡給一組合理起點
+        return (
+            0.5 * age +
+            0.2 * inv_freq +
+            0.1 * size_penalty +
+            0.2 * wl_pen
+        )
 
 
 def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:
@@ -297,5 +424,7 @@ def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:
         return LFUEvictor()
     elif eviction_policy == EvictionPolicy.FIFO:
         return FIFOEvictor()
+    elif eviction_policy == EvictionPolicy.WORKLOAD_AWARE:
+        return WorkloadAwareEvictor()
     else:
         raise ValueError(f"Unknown cache eviction policy: {eviction_policy}")
