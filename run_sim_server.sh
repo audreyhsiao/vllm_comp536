@@ -12,11 +12,11 @@ python -m vllm.entrypoints.openai.api_server \
   --sim-prefill-ms-per-tok 0 \
   --sim-decode-ms-base 0 \
   --sim-decode-ms-per-seq 0 \
-  --max-model-len 2048 \
+  --max-model-len 1024 \
   --enable-prefix-caching \
   --enforce-eager \
   --disable-log-requests \
   --skip-tokenizer-init \
   --disable-frontend-multiprocessing \
-  --num-gpu-blocks-override 128 \
+  --num-gpu-blocks-override 64 \
   --eviction-policy workload_aware

@@ -290,21 +290,15 @@ class FIFOEvictor(Evictor):
     @property
     def num_blocks(self) -> int:
         return len(self.free_table)
-    
+
 class WorkloadAwareEvictor(Evictor):
     """
-    Mixed workload policy
-
-    目標：
-    - 同一 workload 內部維持類 LRU / LFU 行為
-    - 不同 workload 根據整體 cache 使用貢獻調整保護強度
+    優先把只用過一次的 block 丟掉
+    若全部 block 都用過至少兩次 則退化成普通 LRU
     """
 
     def __init__(self):
         self.free_table: Dict[int, BlockMetaData] = {}
-        # per-workload 累積 access 次數
-        self.workload_accesses: Dict[int, int] = {}
-        # 追蹤目前最大 timestamp 作為 now_step
         self.current_time: float = 0.0
 
     def __contains__(self, block_id: int) -> bool:
@@ -318,20 +312,22 @@ class WorkloadAwareEvictor(Evictor):
         if not self.free_table:
             raise ValueError("No usable cache memory left")
 
-        # 計算 per-workload penalty
-        workload_penalty = self._compute_workload_penalty()
-
-        victim_id: Optional[int] = None
-        victim_score: float = float("-inf")
+        # 先在 access_count == 1 的集合裡找最舊者
+        victim_id = None
+        victim_ts = None
 
         for block_id, meta in self.free_table.items():
-            score = self._eviction_score(meta, workload_penalty)
-            if score > victim_score:
-                victim_score = score
-                victim_id = block_id
+            if meta.access_count == 1:
+                if victim_ts is None or meta.last_accessed < victim_ts:
+                    victim_ts = meta.last_accessed
+                    victim_id = block_id
 
+        # 如果沒有 single-use block 就做普通 LRU
         if victim_id is None:
-            raise ValueError("No usable cache memory left")
+            for block_id, meta in self.free_table.items():
+                if victim_ts is None or meta.last_accessed < victim_ts:
+                    victim_ts = meta.last_accessed
+                    victim_id = block_id
 
         meta = self.free_table.pop(victim_id)
         return victim_id, meta.content_hash
@@ -346,8 +342,8 @@ class WorkloadAwareEvictor(Evictor):
             last_accessed,
             workload_type=workload_type,
         )
+        meta.access_count = 1
         self.free_table[block_id] = meta
-        self._record_access(meta)
 
     def update(self, block_id: int, last_accessed: float):
         meta = self.free_table.get(block_id)
@@ -356,65 +352,116 @@ class WorkloadAwareEvictor(Evictor):
         self.current_time = max(self.current_time, last_accessed)
         meta.last_accessed = last_accessed
         meta.access_count += 1
-        self._record_access(meta)
 
     def remove(self, block_id: int):
         if block_id not in self.free_table:
             raise ValueError(
-                "Attempting to remove block that's not in the evictor"
+                "Attempting to remove block that is not in evictor"
             )
         self.free_table.pop(block_id)
 
-    # internal helpers
+    
+# class WorkloadAwareEvictor(Evictor):
+#     """
+#     Workload-aware LFU:
 
-    def _record_access(self, meta: BlockMetaData):
-        """統計 per-workload 使用強度"""
-        if meta.workload_type is None:
-            return
-        self.workload_accesses[meta.workload_type] = \
-            self.workload_accesses.get(meta.workload_type, 0) + 1
+#     - 主要行為：LFU + 一點 recency （和原本 LFU 一樣）
+#     - 差別：對不同 workload 給不同 weight
+#       => access_count * weight 當作「有效使用次數」
+#       => 想保護的 workload 用 weight < 1
+#          比較不重要的 workload 用 weight > 1
+#     """
 
-    def _compute_workload_penalty(self) -> Dict[int, float]:
-        """hit 多的 workload 給較小 penalty"""
-        if not self.workload_accesses:
-            return {}
+#     def __init__(self):
+#         self.free_table: Dict[int, BlockMetaData] = {}
+#         self.current_time: float = 0.0
 
-        max_access = max(self.workload_accesses.values())
-        if max_access <= 0:
-            max_access = 1
+#         # 根據 Task 1 的 per-workload 分析手動調
+#         # 假設：
+#         #   0: qwen   (prefix reuse 最強)  -> 0.8
+#         #   1: ccbench                         -> 1.0
+#         #   2: agentbank (reuse 最弱)       -> 1.1
+#         self.workload_weights: Dict[int, float] = {
+#             0: 0.8,
+#             1: 1.0,
+#             2: 1.1,
+#         }
 
-        penalty: Dict[int, float] = {}
-        for w, cnt in self.workload_accesses.items():
-            importance = cnt / max_access   # 0~1, 大代表常用
-            penalty[w] = 1.0 - importance   # 0~1, 大代表容易被丟
-        return penalty
+#     def __contains__(self, block_id: int) -> bool:
+#         return block_id in self.free_table
 
-    def _eviction_score(self,
-                        meta: BlockMetaData,
-                        workload_penalty: Dict[int, float]) -> float:
-        """score 越大越優先被 evict"""
+#     @property
+#     def num_blocks(self) -> int:
+#         return len(self.free_table)
 
-        # recency
-        age = max(0.0, self.current_time - meta.last_accessed)
+#     def evict(self) -> Tuple[int, int]:
+#         if not self.free_table:
+#             raise ValueError("No usable cache memory left")
 
-        # frequency
-        inv_freq = 1.0 / (1.0 + meta.access_count)
+#         victim_id = None
+#         victim_key = None  # key 越小越優先被 evict
 
-        # prefix 長度保護（越長越不想丟）
-        size_penalty = 1.0 / max(1, meta.num_hashed_tokens)
+#         for block_id, meta in self.free_table.items():
+#             key = self._eviction_key(meta)
+#             if victim_key is None or key < victim_key:
+#                 victim_key = key
+#                 victim_id = block_id
 
-        # workload 層級 penalty
-        wl_pen = 1.0
-        if meta.workload_type is not None:
-            wl_pen = workload_penalty.get(meta.workload_type, 1.0)
+#         if victim_id is None:
+#             raise ValueError("No usable cache memory left")
 
-        # 係數可以調，這裡給一組合理起點
-        return (
-            0.5 * age +
-            0.2 * inv_freq +
-            0.1 * size_penalty +
-            0.2 * wl_pen
-        )
+#         meta = self.free_table.pop(victim_id)
+#         return victim_id, meta.content_hash
+
+#     def add(self, block_id: int, content_hash: int,
+#             num_hashed_tokens: int, last_accessed: float,
+#             workload_type: Optional[int] = None):
+#         self.current_time = max(self.current_time, last_accessed)
+#         meta = BlockMetaData(
+#             content_hash,
+#             num_hashed_tokens,
+#             last_accessed,
+#             workload_type=workload_type,
+#         )
+#         meta.access_count = 1
+#         self.free_table[block_id] = meta
+
+#     def update(self, block_id: int, last_accessed: float):
+#         meta = self.free_table.get(block_id)
+#         if meta is None:
+#             return
+#         self.current_time = max(self.current_time, last_accessed)
+#         meta.last_accessed = last_accessed
+#         meta.access_count += 1
+
+#     def remove(self, block_id: int):
+#         if block_id not in self.free_table:
+#             raise ValueError(
+#                 "Attempting to remove block that's not in the evictor"
+#             )
+#         self.free_table.pop(block_id)
+
+#     # ---------- internal helpers ----------
+
+#     def _workload_weight(self, workload_type: Optional[int]) -> float:
+#         if workload_type is None:
+#             return 1.0
+#         return self.workload_weights.get(workload_type, 1.0)
+
+#     def _eviction_key(self, meta: BlockMetaData) -> Tuple[float, float]:
+#         """
+#         key 越小越先被 evict
+
+#         第一個 key: effective_access = access_count * workload_weight
+#             -> access 少、weight 大（不重要 workload）會先被 evict
+#         第二個 key: last_accessed
+#             -> 在 access 次數一樣時，越舊越先被 evict
+#         """
+
+#         w = self._workload_weight(meta.workload_type)
+#         effective_access = meta.access_count * w
+#         return (effective_access, meta.last_accessed)
+
 
 
 def make_evictor(eviction_policy: EvictionPolicy) -> Evictor:
