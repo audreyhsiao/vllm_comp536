@@ -3,6 +3,15 @@ from typing import List, Dict, Any
 
 from .standard_schema import StandardExample
 
+def map_workload_type(t: str) -> str:
+    mapping = {
+        "agent": "agentbank",
+        "coding": "ccbench",
+        "online_trace_A": "qwen",
+    }
+    if t not in mapping:
+        raise ValueError(f"Unknown workload_type: {t}")
+    return mapping[t]
 
 def export_for_m2(
     examples: List[StandardExample],
@@ -20,7 +29,7 @@ def export_for_m2(
     """
     # 先確保是 list（避免傳來的是 generator）
     examples = list(examples)
-
+    # print(examples[0])
     # -------- 1) 給 M2 用的主資料 --------
     data_payload = []
     for ex in examples:
@@ -30,6 +39,7 @@ def export_for_m2(
                 {"role": m.role, "content": m.content}
                 for m in ex.conversations
             ],
+            "workload_type": map_workload_type(ex.workload_type),
         })
 
     with open(data_path, "w", encoding="utf-8") as f:
