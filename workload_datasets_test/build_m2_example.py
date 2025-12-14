@@ -78,14 +78,14 @@ def main() -> None:
     all_examples = mix_examples(
         agent_examples, coding_examples, qwenA_examples,
         weights=(0.5, 0.4, 0.1),
-        total=15,
+        total=250,
         seed=42
     )
 
-    export_for_m2(all_examples, "m2_data_all.json", "m2_index_all.jsonl")
+    export_for_m2(all_examples, "m2_data_all_250.json", "m2_index_all_250.jsonl")
 
 
-    print("Done. 已輸出 m2_data_*.json 和 m2_index_*.jsonl")
+    print("Done. 已輸出 m2_data_all_250.json 和 m2_index_all_250.jsonl")
 
 
 if __name__ == "__main__":
